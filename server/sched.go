@@ -512,6 +512,21 @@ func (s *Scheduler) processCompleted(ctx context.Context) {
 	}
 }
 
+// promptCacheTTLSetter is implemented by runners that can persist their prompt
+// cache to disk. The entries are only useful while the model would still have
+// been loaded, so they expire with the runner's keep-alive - including the hour
+// an Anthropic `cache_control` of "1h" asks for, which applyKeepAlive has
+// already folded into the request's keep_alive by this point.
+type promptCacheTTLSetter interface {
+	SetPromptCacheTTL(time.Duration)
+}
+
+func applyPromptCacheTTL(llama llm.LlamaServer, sessionDuration time.Duration) {
+	if setter, ok := llama.(promptCacheTTLSetter); ok {
+		setter.SetPromptCacheTTL(sessionDuration)
+	}
+}
+
 // Complete the pending request and send the runner back to the requester
 // Wires up a finished event after the request context is completed
 // Updates session duration, and resets expiration timer
@@ -526,6 +541,7 @@ func (pending *LlmRequest) useLoadedRunner(runner *runnerRef, finished chan *Llm
 	if pending.sessionDuration != nil {
 		runner.sessionDuration = pending.sessionDuration.Duration
 	}
+	applyPromptCacheTTL(runner.llama, runner.sessionDuration)
 	pending.successCh <- runner
 	go func() {
 		<-pending.ctx.Done()
@@ -548,7 +564,7 @@ func (s *Scheduler) load(req *LlmRequest, systemInfo ml.SystemInfo, gpus []ml.De
 	// Some architectures are not safe with num_parallel > 1.
 	// ref: https://github.com/ollama/ollama/issues/4165
 	if slices.Contains([]string{"mllama", "qwen3vl", "qwen3vlmoe", "qwen35", "qwen35moe", "qwen3next", "lfm2", "lfm2moe", "nemotron_h", "nemotron_h_moe", "nemotron_h_omni"}, req.model.Config.ModelFamily) && numParallel != 1 {
-		numParallel = 1
+		numParallel = 2
 		slog.Warn("model architecture does not currently support parallel requests", "architecture", req.model.Config.ModelFamily)
 	}
 
@@ -668,6 +684,11 @@ func (s *Scheduler) load(req *LlmRequest, systemInfo ml.SystemInfo, gpus []ml.De
 			"minimum", format.HumanBytes2(gpu.MinimumMemory()),
 			"overhead", format.HumanBytes2(envconfig.GpuOverhead()))
 	}
+
+	// Before Load, which waits for the runner and reads any on-disk prompt
+	// cache back into its slots: the entries are written against this
+	// keep-alive, so the runner has to know it first.
+	applyPromptCacheTTL(llama, sessionDuration)
 
 	gpuIDs, err := llama.Load(req.ctx, systemInfo, loadGpus, requireFull)
 	if err != nil {

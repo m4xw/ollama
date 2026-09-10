@@ -317,6 +317,22 @@ Alternatively, you can change the amount of time all models are loaded into memo
 
 The `keep_alive` API parameter with the `/api/generate` and `/api/chat` API endpoints will override the `OLLAMA_KEEP_ALIVE` setting.
 
+## How do I keep a prompt cache across model unloads?
+
+Ollama keeps the processed prompt (the KV cache) in memory so a follow-up request only has to process the new tokens. That cache normally dies with the model: once the model unloads, or the server restarts, the next request re-processes the whole prompt.
+
+When a second request takes a busy model's slot over - a background or review task alongside a conversation, say - the displaced prompt is parked in host memory and read back the next time it returns, so the conversation does not pay for its prefill twice. `OLLAMA_PROMPT_CACHE_RAM` sets how much memory that holds, in MiB (default 8192). Raise it if you alternate between several large prompts: each parked prompt costs roughly the size of its KV cache, and once the limit is reached the oldest one is dropped.
+
+Set `OLLAMA_PROMPT_CACHE_DIR` to a directory to also mirror it to disk. After each request the model's slots are written there, and the state is loaded back the next time the same model starts, so a long shared prefix survives an unload or a restart.
+
+Entries are kept for the model's effective keep-alive - `OLLAMA_KEEP_ALIVE`, or the `keep_alive` the request asked for - and expired entries are removed the next time the model loads. Setting `keep_alive` to `0` also disables writing.
+
+Two things to keep in mind:
+
+- Each entry is the full KV cache of one slot, which is hundreds of megabytes for a large context. Point the variable at a disk with room for one entry per slot per model configuration.
+- A restored cache is only reused when the next prompt starts with the same tokens. A prompt that changes anything in the prefix - a different system prompt, a different tool list, re-rendered history - is processed from scratch, on disk or in memory alike.
+- Models whose state cannot be rewound - the recurrent and hybrid architectures, such as the Qwen3.5, Qwen3-Next and Nemotron-H families - are stricter still: what is saved is the state after the last response, and only a prompt that continues from exactly there is resumed. Continuing the same conversation hits; re-sending an earlier prompt, or starting a new conversation that merely shares the system prompt, does not.
+
 ## How do I manage the maximum number of requests the Ollama server can queue?
 
 If too many requests are sent to the server, it will respond with a 503 error indicating the server is overloaded. You can adjust how many requests may be queued by setting `OLLAMA_MAX_QUEUE`.

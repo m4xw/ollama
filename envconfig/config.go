@@ -123,6 +123,29 @@ func Models() string {
 	return filepath.Join(home, ".ollama", "models")
 }
 
+// PromptCacheDir returns the directory used to mirror llama-server slot KV
+// state to disk, configured via OLLAMA_PROMPT_CACHE_DIR. An empty value (the
+// default) leaves the prompt cache in host memory only, where it is lost when
+// the model unloads.
+func PromptCacheDir() string {
+	return Var("OLLAMA_PROMPT_CACHE_DIR")
+}
+
+// PromptCacheRAM returns the size in MiB of llama-server's host-memory prompt
+// cache, configured via OLLAMA_PROMPT_CACHE_RAM. This is where the state of a
+// slot goes when another request takes the slot over, and where it is read back
+// from when the original prompt returns, so it wants room for every prompt that
+// is being alternated between. -1 removes the limit, 0 disables the cache.
+func PromptCacheRAM() int {
+	mib := 8192
+	if s := Var("OLLAMA_PROMPT_CACHE_RAM"); s != "" {
+		if n, err := strconv.Atoi(s); err == nil {
+			mib = n
+		}
+	}
+	return mib
+}
+
 // KeepAlive returns the duration that models stay loaded in memory. KeepAlive can be configured via the OLLAMA_KEEP_ALIVE environment variable.
 // Negative values are treated as infinite. Zero is treated as no keep alive.
 // Default is 5 minutes.
@@ -329,6 +352,8 @@ func AsMap() map[string]EnvVar {
 		"OLLAMA_MAX_TRANSFER_STREAMS": {"OLLAMA_MAX_TRANSFER_STREAMS", MaxTransferStreams(), "Maximum parallel transfer streams for safetensors model pulls/pushes (default 4)"},
 		"OLLAMA_MAX_QUEUE":            {"OLLAMA_MAX_QUEUE", MaxQueue(), "Maximum number of queued requests"},
 		"OLLAMA_MODELS":               {"OLLAMA_MODELS", Models(), "The path to the models directory"},
+		"OLLAMA_PROMPT_CACHE_DIR":     {"OLLAMA_PROMPT_CACHE_DIR", PromptCacheDir(), "Directory to persist prompt caches to disk, kept for the model's keep-alive duration (default: disabled)"},
+		"OLLAMA_PROMPT_CACHE_RAM":     {"OLLAMA_PROMPT_CACHE_RAM", PromptCacheRAM(), "Size in MiB of the host memory prompt cache holding displaced prompts (default 8192, -1 unlimited, 0 disabled)"},
 		"OLLAMA_NO_CLOUD":             {"OLLAMA_NO_CLOUD", NoCloud(), "Disable Ollama cloud features (remote inference and web search)"},
 		"OLLAMA_NOHISTORY":            {"OLLAMA_NOHISTORY", NoHistory(), "Do not preserve readline history"},
 		"OLLAMA_NOPRUNE":              {"OLLAMA_NOPRUNE", NoPrune(), "Do not prune model blobs on startup"},

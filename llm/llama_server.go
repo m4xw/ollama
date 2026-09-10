@@ -185,6 +185,10 @@ type llamaServerRunner struct {
 	launch                  llamaServerLaunchConfig
 	output                  *memoryParsingWriter
 	mmprojOffloadOOMRetried bool
+
+	// promptCache mirrors slot KV state to disk when OLLAMA_PROMPT_CACHE_DIR
+	// is set; nil otherwise.
+	promptCache *promptCacheStore
 }
 
 type llamaServerLaunchConfig struct {
@@ -388,6 +392,7 @@ func startLlamaServer(launch llamaServerLaunchConfig, out io.Writer) (cmd *exec.
 		"--port", strconv.Itoa(port),
 		"--host", "127.0.0.1",
 		"--no-webui",
+		"--reasoning-preserve",
 		"--offline",
 		"-c", strconv.Itoa(launch.opts.NumCtx * launch.numParallel),
 	}
@@ -397,8 +402,24 @@ func startLlamaServer(launch llamaServerLaunchConfig, out io.Writer) (cmd *exec.
 	if launch.decision {
 		params = append(params, "-np", "16", "--kv-unified", "--cache-ram", "0")
 	} else {
-		params = append(params, "-np", strconv.Itoa(launch.numParallel))
+		params = append(params,
+			"-np", strconv.Itoa(launch.numParallel),
+			"--cont-batching",
+			"--no-kv-unified",
+			"--spec-type", "none",
+			// Displaced prompts are parked in host memory and read back when they
+			// return, so a background task taking the slot over does not cost the
+			// conversation its prefill. See envconfig.PromptCacheRAM.
+			"--cache-idle-slots",
+			"--cache-ram", strconv.Itoa(envconfig.PromptCacheRAM()),
+		)
 	}
+	if dir := envconfig.PromptCacheDir(); dir != "" {
+		// Enables POST /slots/{id}?action=save|restore, which is how Ollama
+		// persists the prompt cache across unloads. See prompt_cache_disk.go.
+		params = append(params, "--slot-save-path", promptCacheSlotSavePath(dir))
+	}
+
 	params = appendLlamaServerLogArgs(params)
 	params = appendJinjaArgs(params, launch.config)
 
@@ -421,6 +442,8 @@ func startLlamaServer(launch llamaServerLaunchConfig, out io.Writer) (cmd *exec.
 
 	params = appendFlashAttentionArgs(params, launch.gpus)
 
+	launch.opts.NumBatch = 4096
+
 	params = appendBatchArgs(params, launch.opts, launch.embedding, launch.numParallel)
 
 	// GPU layer offloading — only pass if user explicitly set it (non-default).
@@ -435,6 +458,7 @@ func startLlamaServer(launch llamaServerLaunchConfig, out io.Writer) (cmd *exec.
 
 	// Thread count — only pass if user explicitly set it.
 	// Default behavior: let llama-server auto-detect.
+	launch.opts.NumThread = 16
 	if launch.opts.NumThread > 0 {
 		params = append(params, "-t", strconv.Itoa(launch.opts.NumThread))
 	}
@@ -1043,6 +1067,15 @@ func (s *llamaServerRunner) startProcess() error {
 		return err
 	}
 
+	if s.promptCache == nil {
+		s.promptCache = newPromptCacheStore(s.launch)
+	} else {
+		// A restart (an mmproj offload retry, say) comes up with empty slots,
+		// so the on-disk state is worth reading again. The keep-alive the
+		// scheduler already handed over is kept.
+		s.promptCache.armRestore()
+	}
+
 	s.cmd = cmd
 	s.port = port
 	s.done = make(chan struct{})
@@ -1401,6 +1434,7 @@ func (s *llamaServerRunner) WaitUntilRunning(ctx context.Context) error {
 				s.status.SetLastError("")
 			}
 			slog.Info(fmt.Sprintf("llama-server started in %0.2f seconds", time.Since(s.loadStart).Seconds()))
+			s.restorePromptCache(ctx)
 			return nil
 		case ServerStatusError:
 			msg := s.lastErrMsg()
@@ -1589,6 +1623,7 @@ type llamaServerMultimodalPrompt struct {
 // llamaServerCompletionResponse is the response format from llama-server's /completion endpoint.
 type llamaServerCompletionResponse struct {
 	Content                 string                 `json:"content"`
+	IDSlot                  *int                   `json:"id_slot"`
 	Stop                    bool                   `json:"stop"`
 	StopType                string                 `json:"stop_type"`
 	Timings                 llamaServerTimings     `json:"timings"`
@@ -1800,6 +1835,7 @@ func (s *llamaServerRunner) Completion(ctx context.Context, req CompletionReques
 	var tokenRepeat int
 	var finalResp CompletionResponse
 	var hasFinalResp bool
+	var idSlot *int
 
 	for scanner.Scan() {
 		select {
@@ -1822,6 +1858,10 @@ func (s *llamaServerRunner) Completion(ctx context.Context, req CompletionReques
 			var lsResp llamaServerCompletionResponse
 			if err := json.Unmarshal(evt, &lsResp); err != nil {
 				return fmt.Errorf("error unmarshalling llama-server response: %v", err)
+			}
+
+			if lsResp.IDSlot != nil {
+				idSlot = lsResp.IDSlot
 			}
 
 			// Token repeat detection
@@ -1885,6 +1925,9 @@ func (s *llamaServerRunner) Completion(ctx context.Context, req CompletionReques
 		}
 
 		fn(finalResp)
+		if idSlot != nil {
+			s.savePromptCache(*idSlot)
+		}
 		return nil
 	}
 
@@ -2198,6 +2241,11 @@ func (s *llamaServerRunner) Chat(ctx context.Context, req ChatRequest, fn func(C
 		}
 
 		fn(finalResp)
+		// The OpenAI-compatible stream does not report which slot served the
+		// request, so this path can only persist an unambiguous single slot.
+		if s.launch.numParallel <= 1 {
+			s.savePromptCache(0)
+		}
 		return nil
 	}
 

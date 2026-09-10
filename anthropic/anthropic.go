@@ -80,6 +80,10 @@ type MessagesRequest struct {
 	Thinking      *ThinkingConfig `json:"thinking,omitempty"`
 	Metadata      *Metadata       `json:"metadata,omitempty"`
 	OutputConfig  *OutputConfig   `json:"output_config,omitempty"`
+
+	// CacheControl requests automatic prompt caching: the breakpoint is placed
+	// on the last cacheable block rather than at an explicit marker.
+	CacheControl *CacheControl `json:"cache_control,omitempty"`
 }
 
 type OutputConfig struct {
@@ -139,6 +143,10 @@ type ContentBlock struct {
 	// For thinking blocks - pointer so field only appears when set (SDK requires it for accumulation)
 	Thinking  *string `json:"thinking,omitempty"`
 	Signature string  `json:"signature,omitempty"`
+
+	// CacheControl marks this block as the end of a cacheable prompt prefix.
+	// Only meaningful on request blocks; never set on generated output.
+	CacheControl *CacheControl `json:"cache_control,omitempty"`
 }
 
 // Citation represents a citation in a text block
@@ -182,6 +190,9 @@ type Tool struct {
 
 	// Web search specific fields
 	MaxUses int `json:"max_uses,omitempty"`
+
+	// CacheControl marks this tool as the end of a cacheable prompt prefix.
+	CacheControl *CacheControl `json:"cache_control,omitempty"`
 }
 
 // ToolChoice controls how the model uses tools
@@ -216,26 +227,23 @@ type MessagesResponse struct {
 	Usage        Usage          `json:"usage"`
 }
 
-// Usage contains token usage information
+// Usage contains token usage information. InputTokens is the uncached
+// remainder only: total prompt size is InputTokens + CacheCreationInputTokens +
+// CacheReadInputTokens.
 type Usage struct {
-	InputTokens          int  `json:"input_tokens"`
-	CacheReadInputTokens *int `json:"cache_read_input_tokens,omitempty"`
-	OutputTokens         int  `json:"output_tokens"`
+	InputTokens              int            `json:"input_tokens"`
+	CacheCreationInputTokens *int           `json:"cache_creation_input_tokens,omitempty"`
+	CacheReadInputTokens     *int           `json:"cache_read_input_tokens,omitempty"`
+	CacheCreation            *CacheCreation `json:"cache_creation,omitempty"`
+	OutputTokens             int            `json:"output_tokens"`
 }
 
-// UsageFromMetrics separates total prompt tokens into uncached and cache-read counts.
+// UsageFromMetrics separates total prompt tokens into uncached and cache-read
+// counts. Requests that carry `cache_control` breakpoints should report through
+// [PromptCacheLayout.UsageFromMetrics] instead so newly prefilled tokens are
+// also attributed to cache_creation_input_tokens.
 func UsageFromMetrics(metrics api.Metrics) Usage {
-	total := max(0, metrics.PromptEvalCount)
-	var cached *int
-	if metrics.PromptEvalCachedCount != nil {
-		count := min(max(0, *metrics.PromptEvalCachedCount), total)
-		cached = &count
-	}
-	return Usage{
-		InputTokens:          total - intValue(cached),
-		CacheReadInputTokens: cached,
-		OutputTokens:         metrics.EvalCount,
-	}
+	return (*PromptCacheLayout)(nil).UsageFromMetrics(metrics)
 }
 
 func intValue(v *int) int {
@@ -297,9 +305,22 @@ type MessageDelta struct {
 
 // DeltaUsage contains cumulative token usage
 type DeltaUsage struct {
-	InputTokens          int  `json:"input_tokens"`
-	CacheReadInputTokens *int `json:"cache_read_input_tokens,omitempty"`
-	OutputTokens         int  `json:"output_tokens"`
+	InputTokens              int            `json:"input_tokens"`
+	CacheCreationInputTokens *int           `json:"cache_creation_input_tokens,omitempty"`
+	CacheReadInputTokens     *int           `json:"cache_read_input_tokens,omitempty"`
+	CacheCreation            *CacheCreation `json:"cache_creation,omitempty"`
+	OutputTokens             int            `json:"output_tokens"`
+}
+
+// DeltaUsageFrom projects a Usage onto the streaming message_delta shape.
+func DeltaUsageFrom(u Usage) DeltaUsage {
+	return DeltaUsage{
+		InputTokens:              u.InputTokens,
+		CacheCreationInputTokens: u.CacheCreationInputTokens,
+		CacheReadInputTokens:     u.CacheReadInputTokens,
+		CacheCreation:            u.CacheCreation,
+		OutputTokens:             u.OutputTokens,
+	}
 }
 
 // MessageStopEvent signals the end of the message
@@ -321,7 +342,29 @@ type StreamErrorEvent struct {
 // FromMessagesRequest converts an Anthropic MessagesRequest to an Ollama api.ChatRequest.
 // An optional thinking descriptor preserves model-defined effort names for rendering.
 func FromMessagesRequest(r MessagesRequest, thinking ...*model.Thinking) (*api.ChatRequest, error) {
+	req, _, err := FromMessagesRequestWithCache(r, thinking...)
+	return req, err
+}
+
+// FromMessagesRequestWithCache converts an Anthropic MessagesRequest to an
+// Ollama api.ChatRequest and also returns the request's prompt cache layout,
+// which the caller needs to report cache_creation_input_tokens. The layout is
+// nil when the request carries no `cache_control` breakpoints.
+// An optional thinking descriptor preserves model-defined effort names for rendering.
+func FromMessagesRequestWithCache(r MessagesRequest, thinking ...*model.Thinking) (*api.ChatRequest, *PromptCacheLayout, error) {
 	logutil.Trace("anthropic: converting request", "req", TraceMessagesRequest(r))
+
+	promptCache, err := ScanPromptCache(r)
+	if err != nil {
+		logutil.Trace("anthropic: invalid cache_control", "err", err)
+		return nil, nil, err
+	}
+	if n := promptCache.Breakpoints(); n > maxCacheBreakpoints {
+		// Upstream rejects this with a 400. Ollama serves the whole prompt from
+		// one KV slot, so every breakpoint is honored instead.
+		slog.Debug("anthropic: request exceeds upstream cache_control breakpoint limit",
+			"breakpoints", n, "limit", maxCacheBreakpoints)
+	}
 
 	var messages []api.Message
 
@@ -353,7 +396,7 @@ func FromMessagesRequest(r MessagesRequest, thinking ...*model.Thinking) (*api.C
 		converted, err := convertMessage(msg)
 		if err != nil {
 			logutil.Trace("anthropic: message conversion failed", "index", i, "role", msg.Role, "err", err)
-			return nil, err
+			return nil, nil, err
 		}
 		messages = append(messages, converted...)
 	}
@@ -398,35 +441,16 @@ func FromMessagesRequest(r MessagesRequest, thinking ...*model.Thinking) (*api.C
 
 		tool, _, err := convertTool(t)
 		if err != nil {
-			return nil, err
+			return nil, nil, err
 		}
 		tools = append(tools, tool)
 	}
 
-	var think *api.ThinkValue
-	if r.Thinking != nil && r.Thinking.Type == "enabled" {
-		think = &api.ThinkValue{Value: true}
+	var modelThinking *model.Thinking
+	if len(thinking) > 0 {
+		modelThinking = thinking[0]
 	}
-	if r.Thinking != nil && r.Thinking.Type == "disabled" {
-		think = &api.ThinkValue{Value: false}
-	}
-	if think == nil && r.OutputConfig != nil {
-		effort := r.OutputConfig.Effort
-		if len(thinking) > 0 && thinking[0].Valid() {
-			if effort != "" {
-				think = &api.ThinkValue{Value: effort}
-			}
-		} else {
-			effort = strings.ToLower(strings.TrimSpace(effort))
-			if effort == "xhigh" {
-				effort = "high"
-			}
-			legacyThink := &api.ThinkValue{Value: effort}
-			if api.ValidateLegacyThinking(legacyThink) == nil {
-				think = legacyThink
-			}
-		}
-	}
+	think := thinkFromThinkingConfig(r.Thinking, r.OutputConfig, modelThinking)
 
 	stream := r.Stream
 	convertedRequest := &api.ChatRequest{
@@ -437,9 +461,141 @@ func FromMessagesRequest(r MessagesRequest, thinking ...*model.Thinking) (*api.C
 		Tools:    tools,
 		Think:    think,
 	}
-	logutil.Trace("anthropic: converted request", "req", TraceChatRequest(convertedRequest))
+	applyKeepAlive(convertedRequest, promptCache)
 
-	return convertedRequest, nil
+	logutil.Trace("anthropic: converted request", "req", TraceChatRequest(convertedRequest),
+		"cache_breakpoints", promptCache.Breakpoints())
+
+	return convertedRequest, promptCache, nil
+}
+
+// thinkFromThinkingConfig derives the Ollama think value from Anthropic's two
+// thinking controls.
+//
+// `thinking.type` carries only on/off; the depth lives in
+// `output_config.effort`. Real clients send BOTH (Claude Code sends
+// `thinking: {type: "enabled"}` alongside an effort), so the effort has to win
+// over a bare "enabled" — otherwise every request collapses to a plain
+// `true` and the caller's effort setting is silently discarded. That was the
+// behavior that made this endpoint diverge from /v1/chat/completions, which
+// derives the level straight from `reasoning_effort`.
+//
+// An explicit `thinking: {type: "disabled"}` still wins over everything: it is
+// the only way for a client to turn thinking off outright.
+//
+// Clients that predate output_config send neither field. Claude Code is one:
+// it puts the depth in `thinking.budget_tokens` and signals "off" by omitting
+// the thinking block, so both of those have to be honored here as well.
+// modelThinking, when valid, carries the model's own effort names: a matching
+// output_config.effort is then passed through exactly instead of being mapped
+// onto the legacy low/medium/high/max levels.
+func thinkFromThinkingConfig(thinking *ThinkingConfig, output *OutputConfig, modelThinking *model.Thinking) *api.ThinkValue {
+	if thinking != nil && thinking.Type == "disabled" {
+		return &api.ThinkValue{Value: false}
+	}
+
+	if modelThinking != nil && modelThinking.Valid() && output != nil && output.Effort != "" {
+		return &api.ThinkValue{Value: output.Effort}
+	}
+
+	effort := ""
+	if output != nil {
+		effort = strings.ToLower(strings.TrimSpace(output.Effort))
+	}
+
+	budget := 0
+	thinkingType := ""
+	if thinking != nil {
+		budget = thinking.BudgetTokens
+		thinkingType = thinking.Type
+	}
+	logutil.Trace("anthropic: thinking controls", "type", thinkingType, "budget_tokens", budget, "effort", effort)
+
+	if think := thinkFromEffort(effort); think != nil {
+		return think
+	}
+
+	// A missing thinking block is how budget_tokens clients turn thinking off.
+	// Claude Code never sends output_config; it sends
+	// `thinking: {type: "enabled", budget_tokens: N}` when thinking is on and
+	// omits the block entirely when it is off. Without this, "off" fell through
+	// to the model default, which routes.go turns back into `true` for any
+	// thinking-capable model — so the client could never switch thinking off.
+	//
+	// This is checked after the effort branch so a request that carries only
+	// output_config.effort still gets its level.
+	if thinking == nil {
+		return &api.ThinkValue{Value: false}
+	}
+
+	switch thinking.Type {
+	// "adaptive" is the current on-mode for Claude 4.6+ models; "enabled" is
+	// the older budget_tokens form.
+	case "enabled", "adaptive":
+		if think := thinkFromBudgetTokens(thinking.BudgetTokens); think != nil {
+			return think
+		}
+		return &api.ThinkValue{Value: true}
+	}
+
+	// Nothing requested: leave thinking at the model's default.
+	return nil
+}
+
+// thinkFromBudgetTokens maps a budget_tokens thinking budget onto Ollama's
+// think levels. Clients that predate output_config.effort — Claude Code among
+// them — express depth only as a token budget, so without this every level
+// from that client collapses to a plain `true`.
+//
+// The thresholds are anchored on the budgets Claude Code actually sends: 8000
+// for its lowest level and 32000 for high. Each bound is inclusive of the
+// anchor below it, so a level lands on the same think value whether the client
+// sends the budget exactly or pads it slightly.
+//
+// The client has five levels and Ollama has four, so the bottom two collapse:
+// 8000 is the smallest budget on the wire and "low" is the smallest think
+// value, leaving nothing below it to map to.
+//
+// A zero or negative budget means the client sent no budget at all, which
+// leaves the caller to fall back to a plain `true`.
+func thinkFromBudgetTokens(budget int) *api.ThinkValue {
+	switch {
+	case budget <= 0:
+		return nil
+	case budget <= 8000:
+		return &api.ThinkValue{Value: "low"}
+	case budget < 32000:
+		return &api.ThinkValue{Value: "medium"}
+	case budget < 64000:
+		return &api.ThinkValue{Value: "high"}
+	default:
+		return &api.ThinkValue{Value: "max"}
+	}
+}
+
+// thinkFromEffort maps an Anthropic effort level onto Ollama's think levels,
+// which are one tier coarser: Anthropic's xhigh sits between high and max.
+//
+// This mirrors openai.thinkFromReasoningEffort with one deliberate difference:
+// xhigh clamps DOWN to high here and UP to max there. That predates this
+// function and is pinned by TestFromMessagesRequest_WithOutputConfigEffortXHighMapsToHigh.
+//
+// An unrecognized effort is left alone rather than rejected: unlike
+// reasoning_effort, effort is not the only thinking control on this endpoint,
+// and a 400 would break a request whose thinking.type is perfectly valid.
+func thinkFromEffort(effort string) *api.ThinkValue {
+	switch effort {
+	case "none":
+		return &api.ThinkValue{Value: false}
+	case "minimal":
+		return &api.ThinkValue{Value: "low"}
+	case "low", "medium", "high", "max":
+		return &api.ThinkValue{Value: effort}
+	case "xhigh", "ultra":
+		return &api.ThinkValue{Value: "high"}
+	default:
+		return nil
+	}
 }
 
 // convertMessage converts an Anthropic MessageParam to Ollama api.Message(s)
@@ -683,6 +839,12 @@ func convertTool(t Tool) (api.Tool, bool, error) {
 
 // ToMessagesResponse converts an Ollama api.ChatResponse to an Anthropic MessagesResponse
 func ToMessagesResponse(id string, r api.ChatResponse) MessagesResponse {
+	return ToMessagesResponseWithCache(id, r, nil)
+}
+
+// ToMessagesResponseWithCache is ToMessagesResponse with the request's prompt
+// cache layout, so usage reports cache_creation_input_tokens.
+func ToMessagesResponseWithCache(id string, r api.ChatResponse, promptCache *PromptCacheLayout) MessagesResponse {
 	var content []ContentBlock
 
 	if r.Message.Thinking != "" {
@@ -717,7 +879,7 @@ func ToMessagesResponse(id string, r api.ChatResponse) MessagesResponse {
 		Model:      r.Model,
 		Content:    content,
 		StopReason: stopReason,
-		Usage:      UsageFromMetrics(r.Metrics),
+		Usage:      promptCache.UsageFromMetrics(r.Metrics),
 	}
 }
 
@@ -742,12 +904,19 @@ func mapStopReason(reason string, hasToolCalls bool) string {
 
 // StreamConverter manages state for converting Ollama streaming responses to Anthropic format
 type StreamConverter struct {
-	ID                   string
-	Model                string
+	ID    string
+	Model string
+
+	// PromptCache is the request's `cache_control` layout, or nil when the
+	// request asked for no caching. Set it before the first Process call.
+	PromptCache *PromptCacheLayout
+
 	firstWrite           bool
 	contentIndex         int
 	inputTokens          int
 	cacheReadTokens      *int
+	cacheCreationTokens  *int
+	cacheCreation        *CacheCreation
 	outputTokens         int
 	estimatedInputTokens int // Estimated tokens from request (used when actual metrics are 0)
 	thinkingStarted      bool
@@ -766,6 +935,14 @@ func NewStreamConverter(id, model string, estimatedInputTokens int) *StreamConve
 	}
 }
 
+// recordUsage latches the prompt-side token counts from a converted usage.
+func (c *StreamConverter) recordUsage(usage Usage) {
+	c.inputTokens = usage.InputTokens
+	c.cacheReadTokens = usage.CacheReadInputTokens
+	c.cacheCreationTokens = usage.CacheCreationInputTokens
+	c.cacheCreation = usage.CacheCreation
+}
+
 // StreamEvent represents a streaming event to be sent to the client
 type StreamEvent struct {
 	Event string
@@ -779,12 +956,25 @@ func (c *StreamConverter) Process(r api.ChatResponse) []StreamEvent {
 	if c.firstWrite {
 		c.firstWrite = false
 		// Use actual metrics if available, otherwise use estimate
-		usage := UsageFromMetrics(r.Metrics)
-		c.inputTokens = usage.InputTokens
-		c.cacheReadTokens = usage.CacheReadInputTokens
-		if c.inputTokens == 0 && intValue(c.cacheReadTokens) == 0 && c.estimatedInputTokens > 0 {
-			c.inputTokens = c.estimatedInputTokens
+		usage := c.PromptCache.UsageFromMetrics(r.Metrics)
+		// The runner reports PromptEvalCachedCount only once prefill has
+		// finished, so the first streamed chunk usually carries no cached
+		// count even when it already carries a prompt size. Attributing the
+		// whole prefix to cache_creation here would stick: the Anthropic
+		// SDKs' message_delta usage has no `cache_creation` field, and
+		// message_start is where the spec puts the prompt-side counts, so a
+		// client reading it keeps the fabricated split for the whole request
+		// and sees a 0% hit rate on a warm cache. Report the prompt size as
+		// plain input_tokens and claim nothing about the cache; message_delta
+		// carries the real split once the runner reports it.
+		if r.Metrics.PromptEvalCachedCount == nil {
+			inputTokens := usage.InputTokens + intValue(usage.CacheReadInputTokens) + intValue(usage.CacheCreationInputTokens)
+			if inputTokens == 0 {
+				inputTokens = c.estimatedInputTokens
+			}
+			usage = Usage{InputTokens: inputTokens}
 		}
+		c.recordUsage(usage)
 
 		events = append(events, StreamEvent{
 			Event: "message_start",
@@ -797,9 +987,11 @@ func (c *StreamConverter) Process(r api.ChatResponse) []StreamEvent {
 					Model:   c.Model,
 					Content: []ContentBlock{},
 					Usage: Usage{
-						InputTokens:          c.inputTokens,
-						CacheReadInputTokens: c.cacheReadTokens,
-						OutputTokens:         0,
+						InputTokens:              c.inputTokens,
+						CacheCreationInputTokens: c.cacheCreationTokens,
+						CacheReadInputTokens:     c.cacheReadTokens,
+						CacheCreation:            c.cacheCreation,
+						OutputTokens:             0,
 					},
 				},
 			},
@@ -980,9 +1172,8 @@ func (c *StreamConverter) Process(r api.ChatResponse) []StreamEvent {
 			})
 		}
 
-		usage := UsageFromMetrics(r.Metrics)
-		c.inputTokens = usage.InputTokens
-		c.cacheReadTokens = usage.CacheReadInputTokens
+		usage := c.PromptCache.UsageFromMetrics(r.Metrics)
+		c.recordUsage(usage)
 		c.outputTokens = usage.OutputTokens
 		stopReason := mapStopReason(r.DoneReason, len(c.toolCallsSent) > 0)
 
@@ -994,9 +1185,11 @@ func (c *StreamConverter) Process(r api.ChatResponse) []StreamEvent {
 					StopReason: stopReason,
 				},
 				Usage: DeltaUsage{
-					InputTokens:          c.inputTokens,
-					CacheReadInputTokens: c.cacheReadTokens,
-					OutputTokens:         c.outputTokens,
+					InputTokens:              c.inputTokens,
+					CacheCreationInputTokens: c.cacheCreationTokens,
+					CacheReadInputTokens:     c.cacheReadTokens,
+					CacheCreation:            c.cacheCreation,
+					OutputTokens:             c.outputTokens,
 				},
 			},
 		})

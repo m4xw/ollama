@@ -801,8 +801,10 @@ func TestFromMessagesRequest_WithThinking(t *testing.T) {
 	if result.Think == nil {
 		t.Fatal("expected Think to be set")
 	}
-	if v, ok := result.Think.Value.(bool); !ok || !v {
-		t.Errorf("expected Think.Value to be true, got %v", result.Think.Value)
+	// budget_tokens is the only depth control these clients have, so a small
+	// budget has to land on a level rather than a bare true.
+	if result.Think.Value != "low" {
+		t.Errorf("expected Think.Value to be low, got %v", result.Think.Value)
 	}
 }
 

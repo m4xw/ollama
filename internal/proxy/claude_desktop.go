@@ -901,18 +901,23 @@ func replaceImagesInContent(content json.RawMessage) (json.RawMessage, bool, err
 	changed := false
 	for i, raw := range blocks {
 		var block struct {
-			Type    string          `json:"type"`
-			Content json.RawMessage `json:"content"`
+			Type         string          `json:"type"`
+			Content      json.RawMessage `json:"content"`
+			CacheControl json.RawMessage `json:"cache_control,omitempty"`
 		}
 		if err := json.Unmarshal(raw, &block); err != nil {
 			continue
 		}
 		switch block.Type {
 		case "image":
+			// Carry any cache_control marker onto the replacement block:
+			// dropping it would silently remove one of the client's prompt
+			// cache breakpoints.
 			replacement, err := json.Marshal(struct {
-				Type string `json:"type"`
-				Text string `json:"text"`
-			}{Type: "text", Text: unsupportedImageNotice})
+				Type         string          `json:"type"`
+				Text         string          `json:"text"`
+				CacheControl json.RawMessage `json:"cache_control,omitempty"`
+			}{Type: "text", Text: unsupportedImageNotice, CacheControl: block.CacheControl})
 			if err != nil {
 				return nil, false, fmt.Errorf("encode unsupported-image notice: %w", err)
 			}

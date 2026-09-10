@@ -232,7 +232,7 @@ func TestAnthropicMessagesMiddleware(t *testing.T) {
 				},
 				Options: map[string]any{"num_predict": 1024},
 				Stream:  &False,
-				Think:   &api.ThinkValue{Value: true},
+				Think:   &api.ThinkValue{Value: "low"},
 			},
 		},
 		{

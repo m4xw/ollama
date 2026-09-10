@@ -8,6 +8,7 @@ func newOrnithRenderer() Renderer {
 	return &OrnithRenderer{
 		Qwen35Renderer: Qwen35Renderer{
 			isThinking:                      true,
+			reasoningEffortInstructions:     true,
 			alwaysRenderAssistantThinkBlock: true,
 			emitEmptyThinkOnNoThink:         true,
 			useImgTags:                      RenderImgTags,

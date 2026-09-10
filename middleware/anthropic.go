@@ -23,9 +23,10 @@ import (
 // AnthropicWriter wraps the response writer to transform Ollama responses to Anthropic format
 type AnthropicWriter struct {
 	BaseWriter
-	stream    bool
-	id        string
-	converter *anthropic.StreamConverter
+	stream      bool
+	id          string
+	converter   *anthropic.StreamConverter
+	promptCache *anthropic.PromptCacheLayout
 }
 
 func (w *AnthropicWriter) writeError(data []byte) (int, error) {
@@ -71,7 +72,7 @@ func (w *AnthropicWriter) writeResponse(data []byte) (int, error) {
 	}
 
 	w.ResponseWriter.Header().Set("Content-Type", "application/json")
-	response := anthropic.ToMessagesResponse(w.id, chatResponse)
+	response := anthropic.ToMessagesResponseWithCache(w.id, chatResponse, w.promptCache)
 	logutil.Trace("anthropic middleware: converted response", "resp", anthropic.TraceMessagesResponse(response))
 	return len(data), json.NewEncoder(w.ResponseWriter).Encode(response)
 }
@@ -104,11 +105,17 @@ type WebSearchAnthropicWriter struct {
 	observedPromptEvalCachedCount *int
 	observedEvalCount             int
 
-	loopInFlight         bool
-	loopBaseInputTok     int
-	loopBaseCacheReadTok *int
-	loopBaseOutputTok    int
-	loopResultCh         chan webSearchLoopResult
+	// promptCacheAnchor freezes the prompt size of the client's original
+	// request. Server-side follow-up turns grow the prompt, and scaling the
+	// breakpoint offsets by the grown total would inflate cache_creation.
+	promptCacheAnchor int
+
+	loopInFlight             bool
+	loopBaseInputTok         int
+	loopBaseCacheReadTok     *int
+	loopBaseCacheCreationTok *int
+	loopBaseOutputTok        int
+	loopResultCh             chan webSearchLoopResult
 
 	streamMessageStarted bool
 	streamHasOpenBlock   bool
@@ -323,6 +330,9 @@ func (w *WebSearchAnthropicWriter) runWebSearchLoop(ctx context.Context, initial
 			"resp", anthropic.TraceChatResponse(followUpResponse),
 		)
 
+		// Content the server appended (tool calls and search results) sits after
+		// the client's last cache_control breakpoint, so its newly prefilled
+		// tokens are plain input rather than cache creation.
 		followUpUsage := anthropic.UsageFromMetrics(followUpResponse.Metrics)
 		usage.InputTokens += followUpUsage.InputTokens
 		usage.CacheReadInputTokens = addOptionalInts(usage.CacheReadInputTokens, followUpUsage.CacheReadInputTokens)
@@ -389,6 +399,7 @@ func (w *WebSearchAnthropicWriter) startLoopWorker(initialResponse api.ChatRespo
 	initialUsage := w.usageWithObservedMetrics(initialResponse.Metrics)
 	w.loopBaseInputTok = initialUsage.InputTokens
 	w.loopBaseCacheReadTok = initialUsage.CacheReadInputTokens
+	w.loopBaseCacheCreationTok = initialUsage.CacheCreationInputTokens
 	w.loopBaseOutputTok = initialUsage.OutputTokens
 	w.loopResultCh = make(chan webSearchLoopResult, 1)
 	w.loopInFlight = true
@@ -439,6 +450,9 @@ func (w *WebSearchAnthropicWriter) applyObservedUsageDelta(response *anthropic.M
 }
 
 func (w *WebSearchAnthropicWriter) recordObservedUsage(metrics api.Metrics) {
+	if w.promptCacheAnchor == 0 && metrics.PromptEvalCount > 0 {
+		w.promptCacheAnchor = metrics.PromptEvalCount
+	}
 	if metrics.PromptEvalCount > w.observedPromptEvalCount {
 		w.observedPromptEvalCount = metrics.PromptEvalCount
 	}
@@ -457,24 +471,34 @@ func (w *WebSearchAnthropicWriter) applyObservedUsageDeltaToUsage(usage *anthrop
 		delta := max(0, optionalIntValue(observed.CacheReadInputTokens)-optionalIntValue(w.loopBaseCacheReadTok))
 		usage.CacheReadInputTokens = addOptionalInts(usage.CacheReadInputTokens, &delta)
 	}
+	if observed.CacheCreationInputTokens != nil {
+		delta := max(0, optionalIntValue(observed.CacheCreationInputTokens)-optionalIntValue(w.loopBaseCacheCreationTok))
+		usage.CacheCreationInputTokens = addOptionalInts(usage.CacheCreationInputTokens, &delta)
+		usage.CacheCreation = addCacheCreation(usage.CacheCreation, observed.CacheCreation, w.loopBaseCacheCreationTok)
+	}
 	if deltaOut := w.observedEvalCount - w.loopBaseOutputTok; deltaOut > 0 {
 		usage.OutputTokens += deltaOut
 	}
 }
 
 func (w *WebSearchAnthropicWriter) currentObservedUsage() anthropic.Usage {
-	return anthropic.UsageFromMetrics(api.Metrics{
-		PromptEvalCount:       w.observedPromptEvalCount,
-		PromptEvalCachedCount: w.observedPromptEvalCachedCount,
-		EvalCount:             w.observedEvalCount,
-	})
+	return w.usageWithObservedMetrics(api.Metrics{})
 }
 
 func (w *WebSearchAnthropicWriter) usageWithObservedMetrics(metrics api.Metrics) anthropic.Usage {
 	metrics.PromptEvalCount = max(metrics.PromptEvalCount, w.observedPromptEvalCount)
 	metrics.PromptEvalCachedCount = maxOptionalInts(metrics.PromptEvalCachedCount, w.observedPromptEvalCachedCount)
 	metrics.EvalCount = max(metrics.EvalCount, w.observedEvalCount)
-	return anthropic.UsageFromMetrics(metrics)
+	return w.promptCache().UsageFromMetricsAnchored(metrics, w.promptCacheAnchor)
+}
+
+// promptCache returns the request's cache_control layout, shared with the
+// inner writer's stream converter.
+func (w *WebSearchAnthropicWriter) promptCache() *anthropic.PromptCacheLayout {
+	if w.inner == nil {
+		return nil
+	}
+	return w.inner.promptCache
 }
 
 func (w *WebSearchAnthropicWriter) startLoopContext() (context.Context, context.CancelFunc) {
@@ -485,7 +509,7 @@ func (w *WebSearchAnthropicWriter) startLoopContext() (context.Context, context.
 }
 
 func (w *WebSearchAnthropicWriter) combineServerAndFinalContent(serverContent []anthropic.ContentBlock, finalResponse api.ChatResponse, usage anthropic.Usage) anthropic.MessagesResponse {
-	converted := anthropic.ToMessagesResponse(w.inner.id, finalResponse)
+	converted := anthropic.ToMessagesResponseWithCache(w.inner.id, finalResponse, w.promptCache())
 
 	content := make([]anthropic.ContentBlock, 0, len(serverContent)+len(converted.Content))
 	content = append(content, serverContent...)
@@ -564,7 +588,7 @@ func (w *WebSearchAnthropicWriter) ensureStreamMessageStart(usage anthropic.Usag
 	}
 
 	inputTokens := usage.InputTokens
-	if inputTokens == 0 && optionalIntValue(usage.CacheReadInputTokens) == 0 {
+	if promptTokens(usage) == 0 {
 		inputTokens = w.estimatedInputTokens
 	}
 
@@ -577,8 +601,10 @@ func (w *WebSearchAnthropicWriter) ensureStreamMessageStart(usage anthropic.Usag
 			Model:   w.req.Model,
 			Content: []anthropic.ContentBlock{},
 			Usage: anthropic.Usage{
-				InputTokens:          inputTokens,
-				CacheReadInputTokens: usage.CacheReadInputTokens,
+				InputTokens:              inputTokens,
+				CacheCreationInputTokens: usage.CacheCreationInputTokens,
+				CacheReadInputTokens:     usage.CacheReadInputTokens,
+				CacheCreation:            usage.CacheCreation,
 			},
 		},
 	}); err != nil {
@@ -690,11 +716,7 @@ func (w *WebSearchAnthropicWriter) writeTerminalResponse(response anthropic.Mess
 		Delta: anthropic.MessageDelta{
 			StopReason: response.StopReason,
 		},
-		Usage: anthropic.DeltaUsage{
-			InputTokens:          response.Usage.InputTokens,
-			CacheReadInputTokens: response.Usage.CacheReadInputTokens,
-			OutputTokens:         response.Usage.OutputTokens,
-		},
+		Usage: anthropic.DeltaUsageFrom(response.Usage),
 	}); err != nil {
 		return err
 	}
@@ -778,7 +800,7 @@ func AnthropicMessagesMiddleware(thinkingLookup ...ThinkingLookup) gin.HandlerFu
 		}
 
 		thinking := modelThinking(thinkingLookup, req.Model)
-		chatReq, err := anthropic.FromMessagesRequest(req, thinking)
+		chatReq, promptCache, err := anthropic.FromMessagesRequestWithCache(req, thinking)
 		if err != nil {
 			c.AbortWithStatusJSON(http.StatusBadRequest, anthropic.NewError(http.StatusBadRequest, err.Error()))
 			return
@@ -800,11 +822,15 @@ func AnthropicMessagesMiddleware(thinkingLookup ...ThinkingLookup) gin.HandlerFu
 		// Estimate input tokens for streaming (actual count not available until generation completes)
 		estimatedTokens := anthropic.EstimateInputTokens(req)
 
+		converter := anthropic.NewStreamConverter(messageID, req.Model, estimatedTokens)
+		converter.PromptCache = promptCache
+
 		innerWriter := &AnthropicWriter{
-			BaseWriter: BaseWriter{ResponseWriter: c.Writer},
-			stream:     req.Stream,
-			id:         messageID,
-			converter:  anthropic.NewStreamConverter(messageID, req.Model, estimatedTokens),
+			BaseWriter:  BaseWriter{ResponseWriter: c.Writer},
+			stream:      req.Stream,
+			id:          messageID,
+			converter:   converter,
+			promptCache: promptCache,
 		}
 
 		if req.Stream {
@@ -841,6 +867,34 @@ func AnthropicMessagesMiddleware(thinkingLookup ...ThinkingLookup) gin.HandlerFu
 
 		c.Next()
 	}
+}
+
+// promptTokens is the total prompt size across Anthropic's three usage buckets.
+func promptTokens(usage anthropic.Usage) int {
+	return usage.InputTokens + optionalIntValue(usage.CacheReadInputTokens) + optionalIntValue(usage.CacheCreationInputTokens)
+}
+
+// addCacheCreation adds the per-TTL creation counts observed beyond base into
+// dst, mirroring the scalar cache_creation_input_tokens delta.
+func addCacheCreation(dst, observed *anthropic.CacheCreation, base *int) *anthropic.CacheCreation {
+	if observed == nil {
+		return dst
+	}
+	deltaTotal := max(0, observed.Ephemeral5mInputTokens+observed.Ephemeral1hInputTokens-optionalIntValue(base))
+	if deltaTotal == 0 && dst != nil {
+		return dst
+	}
+
+	out := anthropic.CacheCreation{}
+	if dst != nil {
+		out = *dst
+	}
+	// Attribute the delta to the TTL buckets in the same proportion the
+	// observed totals carry, preferring 5m (the default) for any remainder.
+	oneHour := min(deltaTotal, observed.Ephemeral1hInputTokens)
+	out.Ephemeral1hInputTokens += oneHour
+	out.Ephemeral5mInputTokens += deltaTotal - oneHour
+	return &out
 }
 
 // hasWebSearchTool checks if the request tools include a web_search tool

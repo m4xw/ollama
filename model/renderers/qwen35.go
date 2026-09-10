@@ -54,6 +54,18 @@ type Qwen35Renderer struct {
 	isThinking bool
 	variant    qwen35RendererVariant
 
+	// reasoningEffortInstructions renders the requested reasoning effort as an
+	// instruction in the system block. It is deliberately separate from
+	// variant: the qwen3.8 variant also changes message validation, system
+	// block suppression, and how assistant reasoning is split out of history,
+	// none of which a renderer needs in order to honor an effort level.
+	reasoningEffortInstructions bool
+
+	// reasoningEffortWhenUnset is the instruction used when the caller asks for
+	// no particular effort. Qwen3.8 opts into its xhigh text here; renderers
+	// that leave it empty stay neutral by default.
+	reasoningEffortWhenUnset string
+
 	alwaysRenderAssistantThinkBlock bool
 	emitEmptyThinkOnNoThink         bool
 	useImgTags                      bool
@@ -63,6 +75,8 @@ func newQwen38Renderer() *Qwen35Renderer {
 	return &Qwen35Renderer{
 		isThinking:                      true,
 		variant:                         qwen35Renderer38,
+		reasoningEffortInstructions:     true,
+		reasoningEffortWhenUnset:        qwen38XHighReasoningInstructions,
 		alwaysRenderAssistantThinkBlock: true,
 		emitEmptyThinkOnNoThink:         true,
 		useImgTags:                      RenderImgTags,
@@ -111,9 +125,13 @@ func splitQwen35ReasoningContent(content, messageThinking string, isThinking, ex
 	return strings.TrimSpace(reasoning), content
 }
 
-func qwen38ReasoningInstructions(think *api.ThinkValue) (string, error) {
+// qwen35ReasoningEffortInstructions maps a think value onto the instruction
+// text that carries the reasoning effort into the prompt. Ollama's think levels
+// are coarser than the instruction set: medium is the neutral default and needs
+// no instruction, and high and max share the same text.
+func qwen35ReasoningEffortInstructions(think *api.ThinkValue, whenUnset string) (string, error) {
 	if think == nil || think.Value == nil {
-		return qwen38XHighReasoningInstructions, nil
+		return whenUnset, nil
 	}
 	if !think.IsValid() {
 		return "", fmt.Errorf("invalid thinking value %v", think.Value)
@@ -219,9 +237,9 @@ func (r *Qwen35Renderer) Render(messages []api.Message, tools []api.Tool, think 
 		isThinking = think.Bool()
 	}
 	reasoningInstructions := ""
-	if r.variant == qwen35Renderer38 {
+	if r.reasoningEffortInstructions {
 		var err error
-		reasoningInstructions, err = qwen38ReasoningInstructions(think)
+		reasoningInstructions, err = qwen35ReasoningEffortInstructions(think, r.reasoningEffortWhenUnset)
 		if err != nil {
 			return "", err
 		}

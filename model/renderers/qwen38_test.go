@@ -388,7 +388,7 @@ func TestQwen38RendererReasoningEffort(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			got, err := qwen38ReasoningInstructions(tt.think)
+			got, err := qwen35ReasoningEffortInstructions(tt.think, qwen38XHighReasoningInstructions)
 			if err != nil {
 				t.Fatal(err)
 			}

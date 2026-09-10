@@ -283,6 +283,7 @@ See the [Claude Code guide](/integrations/claude-code) for Ollama Launch and [di
 - [x] Tools (function calling)
 - [x] Tool results
 - [x] Thinking/extended thinking
+- [x] Prompt caching (`cache_control`)
 
 #### Supported request fields
 
@@ -305,6 +306,7 @@ See the [Claude Code guide](/integrations/claude-code) for Ollama Launch and [di
 - [x] `thinking`
 - [x] `output_config`
   - [x] `effort` (model-defined names)
+- [x] `cache_control` (on `system` blocks, `tools`, message content blocks, and top-level)
 - [ ] `tool_choice`
 - [ ] `metadata`
 
@@ -317,6 +319,8 @@ See the [Claude Code guide](/integrations/claude-code) for Ollama Launch and [di
 - [x] `content` (text, tool_use, thinking blocks)
 - [x] `stop_reason` (end_turn, max_tokens, tool_use)
 - [x] `usage` (input_tokens, output_tokens)
+  - [x] `cache_creation_input_tokens`, `cache_read_input_tokens`
+  - [x] `cache_creation` (ephemeral_5m_input_tokens, ephemeral_1h_input_tokens)
 
 #### Streaming events
 
@@ -330,6 +334,84 @@ See the [Claude Code guide](/integrations/claude-code) for Ollama Launch and [di
 - [x] `error`
 
 Use `/api/show` to discover a model's supported thinking values and default. `thinking.type: "enabled"` and `"disabled"` act as explicit on/off controls. When a model uses its metadata to resolve named levels, supported `output_config.effort` names are applied exactly and unsupported names resolve to the model default. Models without metadata keep the existing compatibility behavior, which trims and lowercases effort names and maps `"xhigh"` to `"high"`.
+
+## Prompt caching
+
+Ollama reuses the KV cache of a loaded model for any prompt that shares a prefix
+with the previous request, which is the same optimization Anthropic's prompt
+caching exposes. `cache_control` markers are accepted wherever the Anthropic API
+accepts them, and cache activity is reported back in `usage`:
+
+```shell
+curl http://localhost:11434/v1/messages -H "Content-Type: application/json" -d '{
+  "model": "qwen3",
+  "max_tokens": 128,
+  "system": [
+    {
+      "type": "text",
+      "text": "<a long, stable system prompt>",
+      "cache_control": {"type": "ephemeral"}
+    }
+  ],
+  "messages": [{"role": "user", "content": "Hello"}]
+}'
+```
+
+```json
+"usage": {
+  "input_tokens": 12,
+  "cache_creation_input_tokens": 4096,
+  "cache_read_input_tokens": 0,
+  "cache_creation": {"ephemeral_5m_input_tokens": 4096, "ephemeral_1h_input_tokens": 0},
+  "output_tokens": 27
+}
+```
+
+Send the same prefix again and those tokens move to `cache_read_input_tokens`.
+As on the Anthropic API, `input_tokens` is the uncached remainder only:
+
+```
+input_tokens + cache_creation_input_tokens + cache_read_input_tokens = total prompt tokens
+```
+
+`cache_control` accepts `{"type": "ephemeral"}` (5 minute TTL) and
+`{"type": "ephemeral", "ttl": "1h"}`. Any other `type` or `ttl` is rejected with
+`invalid_request_error`, matching the Anthropic API.
+
+### Cache TTL and `keep_alive`
+
+The KV cache lives inside the loaded model, so unloading the model discards it.
+Ollama's default `keep_alive` is 5 minutes, which lines up with the default
+ephemeral TTL. A request carrying a `ttl: "1h"` breakpoint therefore raises
+`keep_alive` to one hour for that request, so the prefix survives the gap the
+client asked for. This only ever extends: if `OLLAMA_KEEP_ALIVE` is already an
+hour or more (including `-1`, keep loaded forever), it is left alone.
+
+### Differences from the Anthropic API
+
+- **Token accounting is approximate.** The exact token offset of each breakpoint
+  is not known until the prompt is tokenized, so breakpoints are positioned by
+  their share of the prompt's characters and scaled by the real prompt token
+  count the runner reports. The three `usage` fields always sum to the true
+  total; the split between them is an estimate.
+- **The per-TTL `cache_creation` breakdown is non-streaming only.** Streaming
+  reports it on `message_delta`, but the Anthropic SDKs' delta usage schema has
+  no `cache_creation` field, so SDK clients see it as null. The
+  `cache_creation_input_tokens` scalar is always correct on both paths, and
+  `message_start` deliberately reports no cache counts at all — the real token
+  counts do not exist until generation finishes.
+- **Images do not move a breakpoint.** Breakpoints are positioned by prompt
+  characters, and an image has none — it is tokenized by the vision encoder. A
+  breakpoint placed after a large image is positioned by the text around it, so
+  its reported split will understate the cached prefix.
+- **No minimum cacheable prefix.** Anthropic silently declines to cache prefixes
+  shorter than 512-4096 tokens depending on the model. A local KV cache has no
+  such minimum, so short prefixes are cached and reported.
+- **More than four breakpoints is allowed.** Anthropic rejects a fifth
+  `cache_control` marker with a 400. Ollama serves the whole prompt from one KV
+  slot, so every breakpoint is honored instead.
+- **Cache scope is the loaded model's slot**, not a per-workspace store: it is
+  discarded when the model unloads or another prompt displaces it.
 
 ## Models
 
@@ -389,7 +471,6 @@ The following Anthropic API features are not currently supported:
 | `/v1/messages/count_tokens` | Token counting endpoint |
 | `tool_choice` | Forcing specific tool use or disabling tools |
 | `metadata` | Request metadata (user_id) |
-| Prompt caching | `cache_control` blocks for caching prefixes |
 | Batches API | `/v1/messages/batches` for async batch processing |
 | Citations | `citations` content blocks |
 | PDF support | `document` content blocks with PDF files |
@@ -400,4 +481,5 @@ The following Anthropic API features are not currently supported:
 | Feature | Status |
 |---------|--------|
 | Image content | Base64 images supported; URL images not supported |
-| Extended thinking | Basic support; `budget_tokens` accepted but not enforced |
+| Extended thinking | `output_config.effort` maps to a think level; `budget_tokens` selects one by size but is not enforced as a ceiling |
+| Prompt caching | Supported; token accounting is approximate and there is no per-breakpoint minimum (see [Prompt caching](#prompt-caching)) |

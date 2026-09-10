@@ -1885,3 +1885,35 @@ func requestModel(t *testing.T, r *http.Request) string {
 	}
 	return payload.Model
 }
+
+// A cache_control marker on an image block must survive the vision fallback:
+// dropping it would silently remove one of the client's cache breakpoints.
+func TestReplaceImagesInContentPreservesCacheControl(t *testing.T) {
+	content := json.RawMessage(`[
+		{"type":"image","source":{"type":"base64","media_type":"image/png","data":"abc"},"cache_control":{"type":"ephemeral","ttl":"1h"}},
+		{"type":"text","text":"describe it"}
+	]`)
+
+	rewritten, changed, err := replaceImagesInContent(content)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !changed {
+		t.Fatal("replaceImagesInContent reported no change, want the image replaced")
+	}
+
+	var blocks []map[string]any
+	if err := json.Unmarshal(rewritten, &blocks); err != nil {
+		t.Fatal(err)
+	}
+	if blocks[0]["type"] != "text" {
+		t.Fatalf("block type = %v, want the text notice", blocks[0]["type"])
+	}
+	cc, ok := blocks[0]["cache_control"].(map[string]any)
+	if !ok {
+		t.Fatalf("cache_control = %v, want it carried onto the replacement", blocks[0]["cache_control"])
+	}
+	if cc["type"] != "ephemeral" || cc["ttl"] != "1h" {
+		t.Fatalf("cache_control = %v, want the original ephemeral/1h marker", cc)
+	}
+}

@@ -5,6 +5,7 @@ import (
 	"context"
 	"errors"
 	"log/slog"
+	"math"
 	"os"
 	"sync"
 	"sync/atomic"
@@ -2301,4 +2302,66 @@ func TestSchedulerTracksMultipleLoadedRunners(t *testing.T) {
 
 	expectedFree := uint64(24*format.GigaByte) - uint64(8*format.GigaByte) - uint64(4*format.GigaByte)
 	require.Equal(t, expectedFree, gpus[0].FreeMemory)
+}
+
+type idleUnloadLlm struct {
+	mockLlm
+	idle time.Duration
+}
+
+func (s *idleUnloadLlm) PromptCacheIdleUnload() time.Duration { return s.idle }
+
+func TestIdleUnloadDuration(t *testing.T) {
+	forever := time.Duration(math.MaxInt64)
+
+	cases := []struct {
+		name            string
+		llama           llm.LlamaServer
+		sessionDuration time.Duration
+		want            time.Duration
+	}{
+		{
+			// Without an on-disk prompt cache an unload throws the prefill
+			// away, so the keep-alive is all that counts.
+			name:            "no prompt cache",
+			llama:           &mockLlm{},
+			sessionDuration: forever,
+			want:            forever,
+		},
+		{
+			name:            "idle unload disabled",
+			llama:           &idleUnloadLlm{idle: 0},
+			sessionDuration: forever,
+			want:            forever,
+		},
+		{
+			name:            "idle unload shortens an infinite keep-alive",
+			llama:           &idleUnloadLlm{idle: 5 * time.Minute},
+			sessionDuration: forever,
+			want:            5 * time.Minute,
+		},
+		{
+			// A keep-alive that is already shorter wins: the model would have
+			// gone away sooner anyway.
+			name:            "shorter keep-alive wins",
+			llama:           &idleUnloadLlm{idle: 5 * time.Minute},
+			sessionDuration: time.Minute,
+			want:            time.Minute,
+		},
+		{
+			// Keep "unload as soon as the request finishes" intact.
+			name:            "zero keep-alive stays immediate",
+			llama:           &idleUnloadLlm{idle: 5 * time.Minute},
+			sessionDuration: 0,
+			want:            0,
+		},
+	}
+
+	for _, tt := range cases {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := idleUnloadDuration(tt.llama, tt.sessionDuration); got != tt.want {
+				t.Errorf("idleUnloadDuration() = %v, want %v", got, tt.want)
+			}
+		})
+	}
 }

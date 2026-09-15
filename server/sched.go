@@ -432,7 +432,8 @@ func (s *Scheduler) processCompleted(ctx context.Context) {
 			runner.refMu.Lock()
 			runner.refCount--
 			if runner.refCount <= 0 {
-				if runner.sessionDuration <= 0 {
+				idleDuration := idleUnloadDuration(runner.llama, runner.sessionDuration)
+				if idleDuration <= 0 {
 					slog.Debug("runner with zero duration has gone idle, expiring to unload", "runner", runner)
 					if runner.expireTimer != nil {
 						runner.expireTimer.Stop()
@@ -440,8 +441,8 @@ func (s *Scheduler) processCompleted(ctx context.Context) {
 					}
 					s.expiredCh <- runner
 				} else if runner.expireTimer == nil {
-					slog.Debug("runner with non-zero duration has gone idle, adding timer", "runner", runner, "duration", runner.sessionDuration)
-					runner.expireTimer = time.AfterFunc(runner.sessionDuration, func() {
+					slog.Debug("runner with non-zero duration has gone idle, adding timer", "runner", runner, "duration", idleDuration)
+					runner.expireTimer = time.AfterFunc(idleDuration, func() {
 						slog.Debug("timer expired, expiring to unload", "runner", runner)
 						runner.refMu.Lock()
 						defer runner.refMu.Unlock()
@@ -451,11 +452,11 @@ func (s *Scheduler) processCompleted(ctx context.Context) {
 						}
 						s.expiredCh <- runner
 					})
-					runner.expiresAt = time.Now().Add(runner.sessionDuration)
+					runner.expiresAt = time.Now().Add(idleDuration)
 				} else {
-					slog.Debug("runner with non-zero duration has gone idle, resetting timer", "runner", runner, "duration", runner.sessionDuration)
-					runner.expireTimer.Reset(runner.sessionDuration)
-					runner.expiresAt = time.Now().Add(runner.sessionDuration)
+					slog.Debug("runner with non-zero duration has gone idle, resetting timer", "runner", runner, "duration", idleDuration)
+					runner.expireTimer.Reset(idleDuration)
+					runner.expiresAt = time.Now().Add(idleDuration)
 				}
 			}
 			slog.Debug("after processing request finished event", "runner", runner, "refCount", runner.refCount)
@@ -527,6 +528,30 @@ type promptCacheTTLSetter interface {
 	SetPromptCacheTTL(time.Duration)
 }
 
+// promptCacheIdleUnloader is implemented by runners that mirror their prompt
+// cache to disk and can therefore be unloaded while idle without losing the
+// prefill - the next load restores the saved state.
+type promptCacheIdleUnloader interface {
+	PromptCacheIdleUnload() time.Duration
+}
+
+// idleUnloadDuration returns how long an idle runner should be kept loaded.
+// That is its keep-alive, unless its prompt cache lives on disk and the user
+// asked for idle runners to give their memory back sooner.
+func idleUnloadDuration(llama llm.LlamaServer, sessionDuration time.Duration) time.Duration {
+	unloader, ok := llama.(promptCacheIdleUnloader)
+	if !ok {
+		return sessionDuration
+	}
+	idle := unloader.PromptCacheIdleUnload()
+	// Only ever shorten the wait. A keep-alive of zero means "unload as soon
+	// as the request finishes", which this must not stretch.
+	if idle <= 0 || sessionDuration <= 0 || sessionDuration < idle {
+		return sessionDuration
+	}
+	return idle
+}
+
 func applyPromptCacheTTL(llama llm.LlamaServer, sessionDuration time.Duration) {
 	if setter, ok := llama.(promptCacheTTLSetter); ok {
 		setter.SetPromptCacheTTL(sessionDuration)
@@ -570,7 +595,7 @@ func (s *Scheduler) load(req *LlmRequest, systemInfo ml.SystemInfo, gpus []ml.De
 	// Some architectures are not safe with num_parallel > 1.
 	// ref: https://github.com/ollama/ollama/issues/4165
 	if slices.Contains([]string{"mllama", "qwen3vl", "qwen3vlmoe", "qwen35", "qwen35moe", "qwen3next", "lfm2", "lfm2moe", "nemotron_h", "nemotron_h_moe", "nemotron_h_omni"}, req.model.Config.ModelFamily) && numParallel != 1 {
-		numParallel = 2
+		numParallel = 1
 		slog.Warn("model architecture does not currently support parallel requests", "architecture", req.model.Config.ModelFamily)
 	}
 

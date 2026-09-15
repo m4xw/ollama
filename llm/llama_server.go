@@ -2242,10 +2242,8 @@ func (s *llamaServerRunner) Chat(ctx context.Context, req ChatRequest, fn func(C
 
 		fn(finalResp)
 		// The OpenAI-compatible stream does not report which slot served the
-		// request, so this path can only persist an unambiguous single slot.
-		if s.launch.numParallel <= 1 {
-			s.savePromptCache(0)
-		}
+		// request, so the slots are asked which of them moved.
+		s.savePromptCacheChanged()
 		return nil
 	}
 
@@ -2775,6 +2773,9 @@ func (s *llamaServerRunner) Detokenize(ctx context.Context, tokens []int) (strin
 }
 
 func (s *llamaServerRunner) Close() error {
+	// Let a prompt cache save that is still running finish first: the state it
+	// is writing is the one the next load would start from.
+	s.flushPromptCache()
 	return errors.Join(s.stopProcess(), s.removeSplitDirs())
 }
 

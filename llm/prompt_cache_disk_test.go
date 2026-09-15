@@ -17,6 +17,9 @@ import (
 	"github.com/ollama/ollama/api"
 )
 
+// saveDir is where the fake llama-server in these tests writes slot states.
+var saveDir string
+
 func testLaunchConfig() llamaServerLaunchConfig {
 	opts := api.DefaultOptions()
 	opts.NumCtx = 8192
@@ -295,5 +298,88 @@ func TestRestorePromptCacheDiscardsOnlyRejectedEntries(t *testing.T) {
 				t.Errorf("rejected entry survived: %v", err)
 			}
 		})
+	}
+}
+
+func TestSavePromptCachePublishesAtomically(t *testing.T) {
+	var written atomic.Int64
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var body map[string]string
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			t.Error(err)
+			return
+		}
+		name := body["filename"]
+		if !strings.HasSuffix(name, promptCacheTempSuffix) {
+			t.Errorf("save wrote to %q, want a scratch entry", name)
+		}
+		// llama-server writes the file itself, so stand in for it here.
+		if err := os.WriteFile(filepath.Join(saveDir, name), []byte("state"), 0o644); err != nil {
+			t.Error(err)
+			return
+		}
+		written.Add(1)
+		fmt.Fprint(w, `{"id_slot":0,"n_saved":42,"n_written":5}`)
+	}))
+	defer srv.Close()
+
+	port, err := strconv.Atoi(srv.URL[strings.LastIndex(srv.URL, ":")+1:])
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	dir := t.TempDir()
+	saveDir = dir
+	store := &promptCacheStore{dir: dir, key: "bbbbbbbbbbbbbbbb", slots: 1, saving: make([]atomic.Bool, 1), dirty: make([]atomic.Bool, 1)}
+	store.setKeepAlive(time.Hour)
+
+	s := &llamaServerRunner{port: port, promptCache: store, client: srv.Client()}
+	s.savePromptCache(0)
+	s.flushPromptCache()
+
+	if got := written.Load(); got != 1 {
+		t.Fatalf("saves = %d, want 1", got)
+	}
+
+	// The entry ends up under its live name, stamped with its expiry, and the
+	// scratch file is gone.
+	info, err := os.Stat(store.path(0))
+	if err != nil {
+		t.Fatalf("live entry missing: %v", err)
+	}
+	if !info.ModTime().After(time.Now()) {
+		t.Errorf("entry expiry = %v, want a future stamp", info.ModTime())
+	}
+	if _, err := os.Stat(filepath.Join(dir, promptCacheTempFilename(store.key, 0))); !os.IsNotExist(err) {
+		t.Errorf("scratch entry still present: %v", err)
+	}
+}
+
+func TestPromptCachePruneLeavesFreshScratchEntries(t *testing.T) {
+	dir := t.TempDir()
+	store := &promptCacheStore{dir: dir, key: "cccccccccccccccc", slots: 1, saving: make([]atomic.Bool, 1), dirty: make([]atomic.Bool, 1)}
+
+	now := time.Now()
+	fresh := filepath.Join(dir, promptCacheTempFilename(store.key, 0))
+	stale := filepath.Join(dir, promptCacheTempFilename("dddddddddddddddd", 0))
+	for _, f := range []string{fresh, stale} {
+		if err := os.WriteFile(f, []byte("partial"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	old := now.Add(-2 * promptCacheRequestTimeout)
+	if err := os.Chtimes(stale, old, old); err != nil {
+		t.Fatal(err)
+	}
+
+	store.prune(now)
+
+	// A scratch entry carries no expiry stamp until its save finishes, so one
+	// young enough to still be in flight has to survive a prune.
+	if _, err := os.Stat(fresh); err != nil {
+		t.Errorf("in-flight scratch entry was pruned: %v", err)
+	}
+	if _, err := os.Stat(stale); !os.IsNotExist(err) {
+		t.Errorf("abandoned scratch entry was kept: %v", err)
 	}
 }

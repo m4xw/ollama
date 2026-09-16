@@ -418,6 +418,11 @@ func startLlamaServer(launch llamaServerLaunchConfig, out io.Writer) (cmd *exec.
 		// Enables POST /slots/{id}?action=save|restore, which is how Ollama
 		// persists the prompt cache across unloads. See prompt_cache_disk.go.
 		params = append(params, "--slot-save-path", promptCacheSlotSavePath(dir))
+		// Prompts displaced from a slot go to their own files, found again by
+		// their tokens, so switching conversations keeps both. The directory is
+		// per runner configuration, since a state only loads into the layout
+		// that wrote it. Needs llama/compat/003-server-prompt-cache-disk.patch.
+		params = append(params, "--cache-disk", promptCacheDiskDir(dir, launch))
 	}
 
 	params = appendLlamaServerLogArgs(params)

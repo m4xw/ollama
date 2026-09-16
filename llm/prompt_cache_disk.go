@@ -39,6 +39,15 @@ import (
 // Entries live for the model's effective keep-alive: the same signal that says
 // how long the client expects the prefix to stay warm, including the hour that
 // an Anthropic `cache_control` of "1h" asks for.
+//
+// This mirror only holds what each slot has now, so on its own a new
+// conversation taking the slot over would overwrite the previous one. The
+// displaced prompt is kept by llama-server itself (--cache-disk, carried by
+// llama/compat/003-server-prompt-cache-disk.patch): before a slot is reused it
+// writes the slot to a file of its own under promptCacheDiskDir, and a later
+// request that matches one of those files better than the slot loads it back.
+// Those files are not expired; they are removed only when a newer prompt
+// contains them.
 
 // promptCacheStateVersion is embedded in every entry name. Bump it when the
 // meaning of an entry changes so old files are ignored rather than restored.
@@ -120,6 +129,14 @@ func newPromptCacheStore(launch llamaServerLaunchConfig) *promptCacheStore {
 // without inserting a separator, so it has to end in one.
 func promptCacheSlotSavePath(dir string) string {
 	return strings.TrimRight(dir, `/\`) + string(os.PathSeparator)
+}
+
+// promptCacheDiskDir is the value passed to llama-server's --cache-disk: the
+// directory holding the prompts displaced from this runner's slots. It is a
+// subdirectory, so prune leaves it alone; llama-server removes an entry only
+// once a newer prompt contains it, and never expires them.
+func promptCacheDiskDir(dir string, launch llamaServerLaunchConfig) string {
+	return filepath.Join(dir, "cache-"+promptCacheIdentity(launch))
 }
 
 // promptCacheIdentity derives a short key from everything that changes the

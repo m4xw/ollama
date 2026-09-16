@@ -1,0 +1,546 @@
+server : keep the prompt cache on disk, one file per prompt (--cache-disk)
+
+Ollama-local, applies after 002-server-slot-checkpoints.patch. With --cache-disk DIR the
+prompt cache writes every entry to its own file under DIR and keeps only its tokens in
+memory. Entries survive a restart (the directory is indexed at load), are not
+size-limited, and are removed only when a newer prompt contains them. In disk mode a
+slot is saved before it is reused when more than a ubatch of it would be lost, or when
+a cached prompt matches the task better, so a new conversation sharing only the system
+prompt no longer discards the previous one.
+
+diff --git a/common/arg.cpp b/common/arg.cpp
+index 79405b59..79184de1 100644
+--- a/common/arg.cpp
++++ b/common/arg.cpp
+@@ -1717,6 +1717,14 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
+             params.cache_ram_mib = value;
+         }
+     ).set_env("LLAMA_ARG_CACHE_RAM").set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}));
++    add_opt(common_arg(
++        {"--cache-disk"}, "PATH",
++        "keep the prompt cache in this directory instead of host memory, one file per prompt, kept across restarts "
++        "and not size-limited; entries are only removed when a newer prompt contains them (default: disabled)",
++        [](common_params & params, const std::string & value) {
++            params.cache_disk_path = value;
++        }
++    ).set_env("LLAMA_ARG_CACHE_DISK").set_examples({LLAMA_EXAMPLE_SERVER}));
+     add_opt(common_arg(
+         {"-kvu", "--kv-unified"},
+         {"-no-kvu", "--no-kv-unified"},
+diff --git a/common/common.h b/common/common.h
+index 4e9448bb..39e49b14 100644
+--- a/common/common.h
++++ b/common/common.h
+@@ -689,6 +689,7 @@ struct common_params {
+     bool log_json = false;
+ 
+     std::string slot_save_path;
++    std::string cache_disk_path; // keep the prompt cache in this directory instead of host memory
+     std::string media_path; // path to directory for loading media files
+ 
+     float slot_prompt_similarity = 0.1f;
+diff --git a/tools/server/server-context.cpp b/tools/server/server-context.cpp
+index 7fdaa8c6..8c71a691 100644
+--- a/tools/server/server-context.cpp
++++ b/tools/server/server-context.cpp
+@@ -319,6 +319,13 @@ struct server_slot {
+             llama_state_seq_get_data_ext(ctx_dft, cur->data.drft.data(), cur_size_dft, id, LLAMA_STATE_SEQ_FLAGS_NONE);
+         }
+ 
++        // disk mode: the write happens here, on the server loop, so a large state stalls the other
++        // slots for as long as the write takes - acceptable, the alternative is a full re-prefill
++        if (prompt_cache.disk_enabled() && !prompt_cache.spill(*cur)) {
++            prompt_cache.erase(std::prev(prompt_cache.states.end()));
++            return false;
++        }
++
+         return true;
+     }
+ 
+@@ -1348,7 +1355,14 @@ private:
+             batch.init(std::max(n_batch, params_base.n_parallel), n_embd);
+         }
+ 
+-        if (params_base.cache_ram_mib != 0) {
++        if (!params_base.cache_disk_path.empty()) {
++            prompt_cache = std::make_unique<server_prompt_cache>(-1, 0);
++            prompt_cache->init_disk(params_base.cache_disk_path, ctx_tgt, mctx != nullptr, params_base.n_ctx_checkpoints, params_base.n_ubatch,
++                ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_FULL || n_swa > 0);
++            if (!prompt_cache->disk_enabled()) {
++                prompt_cache.reset();
++            }
++        } else if (params_base.cache_ram_mib != 0) {
+             if (params_base.cache_ram_mib < 0) {
+                 SRV_TRC("prompt cache is enabled, size limit: %s\n", "no limit");
+             } else {
+@@ -1418,8 +1432,8 @@ private:
+         metrics.init();
+ 
+         if (params_base.cache_idle_slots) {
+-            if (params_base.cache_ram_mib == 0) {
+-                SRV_WRN("%s", "--cache-idle-slots requires --cache-ram, disabling\n");
++            if (!prompt_cache) {
++                SRV_WRN("%s", "--cache-idle-slots requires --cache-ram or --cache-disk, disabling\n");
+                 params_base.cache_idle_slots = false;
+             } else {
+                 if (params_base.kv_unified) {
+@@ -1622,6 +1636,17 @@ private:
+             }
+         }
+ 
++        if (ret && prompt_cache && prompt_cache->disk_enabled() && task.type == SERVER_TASK_TYPE_COMPLETION) {
++            // disk mode: an entry costs no memory, so the slot is saved whenever more than a ubatch of it would be
++            // lost, or when a cached prompt matches the task better and replaces it. a smaller divergence is the
++            // usual re-rendering of the last turn: the tail is re-processed in about one ubatch (and the slot keeps
++            // a checkpoint that close to its end), which is not worth writing the whole state out for
++            const size_t n_lcp = ret->prompt.tokens.get_common_prefix(task.tokens);
++
++            update_cache = n_lcp + (size_t) params_base.n_ubatch < ret->prompt.tokens.size() ||
++                prompt_cache->find(ret->prompt, task.tokens) != prompt_cache->states.end();
++        }
++
+         if (ret) {
+             update_cache = update_cache && prompt_cache;
+ 
+diff --git a/tools/server/server-task.cpp b/tools/server/server-task.cpp
+index 0d3beb31..86ba6868 100644
+--- a/tools/server/server-task.cpp
++++ b/tools/server/server-task.cpp
+@@ -10,6 +10,9 @@
+ #include "speculative.h"
+ #include "server-common.h"
+ 
++#include <algorithm>
++#include <filesystem>
++#include <fstream>
+ #include <sstream>
+ 
+ //
+@@ -1708,7 +1711,300 @@ size_t server_prompt_cache::n_tokens() const {
+     return res;
+ }
+ 
++//
++// server_prompt_cache disk mode
++//
++// file layout (native endianness, the files never leave the machine that wrote them):
++//   u32 magic, u32 version
++//   u64 n_tokens, i32 tokens[n_tokens]
++//   u32 n_checkpoints, per checkpoint: i64 n_tokens, i32 pos_min, i32 pos_max, buf tgt, buf dft, buf spec
++//   buf main, buf drft
++// where buf is a u64 size followed by that many bytes
++//
++
++static constexpr uint32_t PROMPT_DISK_MAGIC   = 0x4344504f; // "OPDC"
++static constexpr uint32_t PROMPT_DISK_VERSION = 1;
++
++static bool prompt_disk_read(std::ifstream & ifs, void * dst, size_t size) {
++    return size == 0 || (bool) ifs.read((char *) dst, size);
++}
++
++static bool prompt_disk_read_buf(std::ifstream & ifs, std::vector<uint8_t> & buf) {
++    uint64_t n = 0;
++    // 64 GiB cap, in case the size field itself is corrupted
++    if (!prompt_disk_read(ifs, &n, sizeof(n)) || n > (1ull << 36)) {
++        return false;
++    }
++    try {
++        buf.resize(n);
++    } catch (const std::bad_alloc &) {
++        return false;
++    }
++    return prompt_disk_read(ifs, buf.data(), n);
++}
++
++static void prompt_disk_write(std::ofstream & ofs, const void * src, size_t size) {
++    if (size > 0) {
++        ofs.write((const char *) src, size);
++    }
++}
++
++static void prompt_disk_write_buf(std::ofstream & ofs, const std::vector<uint8_t> & buf) {
++    const uint64_t n = buf.size();
++    prompt_disk_write(ofs, &n, sizeof(n));
++    prompt_disk_write(ofs, buf.data(), n);
++}
++
++// reads the header and the tokens, leaving the stream positioned at the checkpoints
++static bool prompt_disk_read_tokens(std::ifstream & ifs, llama_tokens & tokens) {
++    uint32_t magic   = 0;
++    uint32_t version = 0;
++    uint64_t n       = 0;
++    if (!prompt_disk_read(ifs, &magic, sizeof(magic)) || magic != PROMPT_DISK_MAGIC ||
++        !prompt_disk_read(ifs, &version, sizeof(version)) || version != PROMPT_DISK_VERSION ||
++        !prompt_disk_read(ifs, &n, sizeof(n)) || n == 0 || n > (1ull << 32)) {
++        return false;
++    }
++    tokens.resize(n);
++    return prompt_disk_read(ifs, tokens.data(), n * sizeof(llama_token));
++}
++
++static bool prompt_disk_read_payload(const std::string & path, std::list<common_prompt_checkpoint> & checkpoints, server_prompt_data & data) {
++    std::ifstream ifs(path, std::ios::binary);
++    llama_tokens tokens;
++    if (!ifs || !prompt_disk_read_tokens(ifs, tokens)) {
++        return false;
++    }
++
++    uint32_t count = 0;
++    if (!prompt_disk_read(ifs, &count, sizeof(count)) || count > 1024) {
++        return false;
++    }
++    for (uint32_t i = 0; i < count; ++i) {
++        common_prompt_checkpoint cur;
++        cur.id_task = -1;
++        if (!prompt_disk_read(ifs, &cur.n_tokens, sizeof(cur.n_tokens)) ||
++            !prompt_disk_read(ifs, &cur.pos_min,  sizeof(cur.pos_min)) ||
++            !prompt_disk_read(ifs, &cur.pos_max,  sizeof(cur.pos_max)) ||
++            !prompt_disk_read_buf(ifs, cur.data_tgt) ||
++            !prompt_disk_read_buf(ifs, cur.data_dft) ||
++            !prompt_disk_read_buf(ifs, cur.data_spec)) {
++            return false;
++        }
++        checkpoints.push_back(std::move(cur));
++    }
++
++    return prompt_disk_read_buf(ifs, data.main) && prompt_disk_read_buf(ifs, data.drft);
++}
++
++// note: server_tokens::get_tokens() asserts when a projector is loaded, even for a text-only prompt
++static bool prompt_has_media(const server_tokens & tokens) {
++    for (size_t i = 0; i < tokens.size(); ++i) {
++        if (tokens[i] == LLAMA_TOKEN_NULL) {
++            return true;
++        }
++    }
++    return false;
++}
++
++void server_prompt_cache::init_disk(const std::string & dir, const llama_context * ctx, bool has_mtmd, int32_t n_ctx_checkpoints, int32_t n_ubatch, bool needs_checkpoints) {
++    namespace fs = std::filesystem;
++
++    std::error_code ec;
++    fs::create_directories(fs::u8path(dir), ec);
++    if (ec) {
++        SRV_WRN("prompt cache: cannot create disk directory '%s': %s - disk mode disabled\n", dir.c_str(), ec.message().c_str());
++        return;
++    }
++
++    disk_dir = dir;
++    this->n_ctx_checkpoints = n_ctx_checkpoints;
++    this->n_ubatch          = std::max(n_ubatch, 0);
++    this->needs_checkpoints = needs_checkpoints;
++
++    // entries are only removed when a newer prompt contains them, never to make room
++    limit_size   = 0;
++    limit_tokens = 0;
++
++    const int32_t n_vocab = llama_vocab_n_tokens(llama_model_get_vocab(llama_get_model(ctx)));
++
++    std::vector<std::pair<fs::file_time_type, fs::path>> files;
++    for (const auto & entry : fs::directory_iterator(fs::u8path(dir), ec)) {
++        if (!entry.is_regular_file()) {
++            continue;
++        }
++        const auto & p = entry.path();
++        if (p.extension() == ".tmp") {
++            // a write that did not finish, the process was killed during it
++            fs::remove(p, ec);
++            continue;
++        }
++        if (p.extension() == ".bin") {
++            files.emplace_back(entry.last_write_time(ec), p);
++        }
++    }
++    // oldest first, like the in-memory cache
++    std::sort(files.begin(), files.end());
++
++    for (const auto & [_, p] : files) {
++        std::ifstream ifs(p, std::ios::binary);
++        llama_tokens tokens;
++        bool ok = ifs && prompt_disk_read_tokens(ifs, tokens);
++        for (size_t i = 0; ok && i < tokens.size(); ++i) {
++            ok = tokens[i] >= 0 && tokens[i] < n_vocab;
++        }
++        ifs.close();
++
++        if (!ok) {
++            SRV_WRN("prompt cache: discarding unreadable entry '%s'\n", p.u8string().c_str());
++            fs::remove(p, ec);
++            continue;
++        }
++
++        states.push_back({
++            /*.prompt =*/ { server_tokens(tokens, has_mtmd), {} },
++            /*.data   =*/ {},
++            /*.path   =*/ p.u8string(),
++        });
++    }
++
++    SRV_INF("prompt cache: disk mode, %zu entries in '%s'\n", states.size(), dir.c_str());
++}
++
++bool server_prompt_cache::spill(server_prompt_cache_state & state) {
++    namespace fs = std::filesystem;
++
++    // alloc() refused prompts with media, so every entry is text tokens only
++    llama_tokens tokens(state.prompt.tokens.size());
++    for (size_t i = 0; i < tokens.size(); ++i) {
++        tokens[i] = state.prompt.tokens[i];
++    }
++
++    // FNV-1a over the token ids names the entry
++    uint64_t hash = 0xcbf29ce484222325ull;
++    for (const llama_token t : tokens) {
++        hash = (hash ^ (uint32_t) t) * 0x100000001b3ull;
++    }
++
++    const std::string path = disk_dir + DIRECTORY_SEPARATOR + string_format("prompt-%016llx-%zu.bin", (unsigned long long) hash, tokens.size());
++    const std::string tmp  = path + ".tmp";
++
++    const int64_t t_start = ggml_time_us();
++
++    {
++        std::ofstream ofs(fs::u8path(tmp), std::ios::binary | std::ios::trunc);
++        if (!ofs) {
++            SRV_WRN("prompt cache: cannot write '%s'\n", tmp.c_str());
++            return false;
++        }
++
++        const uint32_t magic   = PROMPT_DISK_MAGIC;
++        const uint32_t version = PROMPT_DISK_VERSION;
++        const uint64_t n       = tokens.size();
++        prompt_disk_write(ofs, &magic,   sizeof(magic));
++        prompt_disk_write(ofs, &version, sizeof(version));
++        prompt_disk_write(ofs, &n,       sizeof(n));
++        prompt_disk_write(ofs, tokens.data(), n * sizeof(llama_token));
++
++        const uint32_t count = (uint32_t) state.prompt.checkpoints.size();
++        prompt_disk_write(ofs, &count, sizeof(count));
++        for (const auto & cur : state.prompt.checkpoints) {
++            prompt_disk_write(ofs, &cur.n_tokens, sizeof(cur.n_tokens));
++            prompt_disk_write(ofs, &cur.pos_min,  sizeof(cur.pos_min));
++            prompt_disk_write(ofs, &cur.pos_max,  sizeof(cur.pos_max));
++            prompt_disk_write_buf(ofs, cur.data_tgt);
++            prompt_disk_write_buf(ofs, cur.data_dft);
++            prompt_disk_write_buf(ofs, cur.data_spec);
++        }
++
++        prompt_disk_write_buf(ofs, state.data.main);
++        prompt_disk_write_buf(ofs, state.data.drft);
++
++        ofs.flush();
++        if (!ofs) {
++            ofs.close();
++            std::error_code ec;
++            fs::remove(fs::u8path(tmp), ec);
++            SRV_WRN("prompt cache: failed to write '%s'\n", tmp.c_str());
++            return false;
++        }
++    }
++
++    std::error_code ec;
++    fs::rename(fs::u8path(tmp), fs::u8path(path), ec);
++    if (ec) {
++        fs::remove(fs::u8path(tmp), ec);
++        SRV_WRN("prompt cache: cannot publish '%s'\n", path.c_str());
++        return false;
++    }
++
++    SRV_INF("prompt cache: wrote %zu tokens, %zu checkpoints, %.3f MiB to '%s' in %.2f ms\n",
++            tokens.size(), state.prompt.checkpoints.size(), state.size() / (1024.0 * 1024.0), path.c_str(),
++            (ggml_time_us() - t_start) / 1000.0);
++
++    state.path = path;
++    state.prompt.checkpoints.clear();
++    state.data = {};
++
++    return true;
++}
++
++std::list<server_prompt_cache_state>::iterator server_prompt_cache::erase(std::list<server_prompt_cache_state>::iterator it) {
++    if (!it->path.empty()) {
++        std::error_code ec;
++        std::filesystem::remove(std::filesystem::u8path(it->path), ec);
++        SRV_TRC(" - removed prompt cache file '%s'\n", it->path.c_str());
++    }
++    return states.erase(it);
++}
++
++bool server_prompt_cache::load_disk(std::list<server_prompt_cache_state>::iterator it, server_prompt & prompt, llama_context * ctx_tgt, llama_context * ctx_dft, int32_t id_slot) {
++    const int64_t t_start = ggml_time_us();
++
++    std::list<common_prompt_checkpoint> checkpoints;
++    server_prompt_data data;
++
++    bool ok = prompt_disk_read_payload(it->path, checkpoints, data);
++    if (!ok) {
++        SRV_WRN("prompt cache: '%s' is unreadable, discarding it\n", it->path.c_str());
++    } else if (!data.drft.empty() && !ctx_dft) {
++        SRV_WRN("prompt cache: '%s' holds a draft state but there is no draft model, discarding it\n", it->path.c_str());
++        ok = false;
++    } else if (llama_state_seq_set_data_ext(ctx_tgt, data.main.data(), data.main.size(), id_slot, 0) != data.main.size()) {
++        SRV_ERR("prompt cache: failed to restore state from '%s', discarding it\n", it->path.c_str());
++        ok = false;
++    } else if (!data.drft.empty() && llama_state_seq_set_data_ext(ctx_dft, data.drft.data(), data.drft.size(), id_slot, 0) != data.drft.size()) {
++        SRV_ERR("prompt cache: failed to restore draft state from '%s', discarding it\n", it->path.c_str());
++        ok = false;
++    }
++
++    if (!ok) {
++        // an entry that failed once will fail again
++        erase(it);
++        return false;
++    }
++
++    while (checkpoints.size() > (size_t) std::max(n_ctx_checkpoints, 0)) {
++        checkpoints.pop_front();
++    }
++
++    SRV_INF("prompt cache: restored %zu tokens, %zu checkpoints from '%s' in %.2f ms\n",
++            it->prompt.tokens.size(), checkpoints.size(), it->path.c_str(), (ggml_time_us() - t_start) / 1000.0);
++
++    prompt = { it->prompt.tokens.clone(), std::move(checkpoints) };
++
++    // the entry is kept: the slot starts out identical to it, and once the slot moves on the file
++    // still holds this prompt (or is removed by alloc() when a newer prompt contains it)
++    return true;
++}
++
+ server_prompt_cache_state * server_prompt_cache::alloc(const server_prompt & prompt, size_t state_size_tgt, size_t state_size_dft) {
++    // media chunks cannot be written out
++    if (disk_enabled() && prompt_has_media(prompt.tokens)) {
++        SRV_TRC("%s", " - prompt contains media, not caching it on disk\n");
++        return nullptr;
++    }
++
+     // first check if the current state is contained fully in the cache
+     for (auto it = states.begin(); it != states.end(); ++it) {
+         const int cur_lcp_len = it->prompt.tokens.get_common_prefix(prompt.tokens);
+@@ -1738,10 +2034,32 @@ server_prompt_cache_state * server_prompt_cache::alloc(const server_prompt & pro
+     for (auto it = states.begin(); it != states.end();) {
+         const int len = it->prompt.tokens.get_common_prefix(prompt.tokens);
+ 
+-        if (len == (int) it->prompt.tokens.size()) {
++        const int n_old = (int) it->prompt.tokens.size();
++
++        bool obsolete = len == n_old;
++
++        // disk mode: also drop an entry that the new prompt can resume to within its last ubatch of tokens, or
++        // every turn of a conversation would leave a file behind (the last turn is re-rendered differently than
++        // it was generated). a memory that cannot be truncated resumes only from a checkpoint, so it has to
++        // hold one that close to the entry's end. at least half of the entry has to be shared, so short
++        // entries are not dropped for any new prompt
++        if (!obsolete && disk_enabled() && 2*len >= n_old) {
++            int n_resume = len;
++            if (needs_checkpoints) {
++                n_resume = 0;
++                for (const auto & ckpt : prompt.checkpoints) {
++                    if (ckpt.n_tokens <= len) {
++                        n_resume = std::max(n_resume, (int) ckpt.n_tokens);
++                    }
++                }
++            }
++            obsolete = n_resume + n_ubatch >= n_old;
++        }
++
++        if (obsolete) {
+             SRV_TRC(" - removing obsolete cached prompt with length %d\n", len);
+ 
+-            it = states.erase(it);
++            it = erase(it);
+         } else {
+             ++it;
+         }
+@@ -1767,6 +2085,11 @@ server_prompt_cache_state * server_prompt_cache::alloc(const server_prompt & pro
+     } catch (const std::bad_alloc & e) {
+         SRV_ERR("failed to allocate memory for prompt cache state: %s\n", e.what());
+ 
++        if (disk_enabled()) {
++            // entries on disk hold no memory, shrinking the limit would only evict them
++            return nullptr;
++        }
++
+         limit_size = std::max<size_t>(1, 0.4*size());
+ 
+         SRV_WRN(" - cache size limit reduced to %.3f MiB\n", limit_size / (1024.0 * 1024.0));
+@@ -1790,7 +2113,7 @@ server_prompt_cache_state * server_prompt_cache::alloc(const server_prompt & pro
+     return &states.back();
+ }
+ 
+-bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tokens_new, llama_context * ctx_tgt, llama_context * ctx_dft, int32_t id_slot) {
++std::list<server_prompt_cache_state>::iterator server_prompt_cache::find(const server_prompt & prompt, const server_tokens & tokens_new) {
+     const int lcp_best = prompt.tokens.get_common_prefix(tokens_new);
+ 
+     float f_keep_best = prompt.tokens.size() > 0 ? float(lcp_best) / prompt.tokens.size() : -1.0f; // empty slot: any cache entry wins
+@@ -1824,6 +2147,18 @@ bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tok
+ 
+     if (it_best != states.end()) {
+         SRV_TRC(" - found better prompt with f_keep = %.3f, f_sim = %.3f\n", f_keep_best, f_sim_best);
++    }
++
++    return it_best;
++}
++
++bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tokens_new, llama_context * ctx_tgt, llama_context * ctx_dft, int32_t id_slot) {
++    const auto it_best = find(prompt, tokens_new);
++
++    if (it_best != states.end()) {
++        if (!it_best->path.empty()) {
++            return load_disk(it_best, prompt, ctx_tgt, ctx_dft, id_slot);
++        }
+ 
+         {
+             auto & data = it_best->data.main;
+diff --git a/tools/server/server-task.h b/tools/server/server-task.h
+index 9c99143f..f68604f8 100644
+--- a/tools/server/server-task.h
++++ b/tools/server/server-task.h
+@@ -598,6 +598,9 @@ struct server_prompt_cache_state {
+     server_prompt prompt;
+     server_prompt_data data;
+ 
++    // disk mode: file holding the checkpoints and the state data, which are not kept in memory
++    std::string path;
++
+     size_t size() const {
+         size_t res = data.size();
+ 
+@@ -631,7 +634,37 @@ struct server_prompt_cache {
+ 
+     bool load(server_prompt & prompt, const server_tokens & tokens_new, llama_context * ctx_tgt, llama_context * ctx_dft, int32_t id_slot);
+ 
++    // the cached prompt that load() would put in place of prompt, or states.end() if there is none
++    std::list<server_prompt_cache_state>::iterator find(const server_prompt & prompt, const server_tokens & tokens_new);
++
+     void update();
++
++    // disk mode: every entry is written to its own file under disk_dir and only its tokens stay in
++    // memory, so displaced prompts survive a restart and are not bounded by host memory
++    std::string disk_dir;
++
++    // disk mode is not size-limited; entries are only removed when a newer prompt contains them, up to a
++    // tail of n_ubatch tokens (the last turn is usually re-rendered differently than it was generated).
++    // needs_checkpoints: the memory cannot be truncated (recurrent / SWA), so it resumes only from a checkpoint
++    void init_disk(const std::string & dir, const llama_context * ctx, bool has_mtmd, int32_t n_ctx_checkpoints, int32_t n_ubatch, bool needs_checkpoints);
++
++    bool disk_enabled() const {
++        return !disk_dir.empty();
++    }
++
++    // write the state data of an entry to its file and drop it from memory
++    bool spill(server_prompt_cache_state & state);
++
++    // erase an entry, together with its file
++    std::list<server_prompt_cache_state>::iterator erase(std::list<server_prompt_cache_state>::iterator it);
++
++private:
++    int32_t n_ctx_checkpoints = 0;
++    int32_t n_ubatch          = 0;
++    bool    needs_checkpoints = false;
++
++    // restore an entry from its file into the slot; the entry stays cached, the file is still valid
++    bool load_disk(std::list<server_prompt_cache_state>::iterator it, server_prompt & prompt, llama_context * ctx_tgt, llama_context * ctx_dft, int32_t id_slot);
+ };
+ 
+ // used exclusively by router mode

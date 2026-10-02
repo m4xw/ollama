@@ -4058,3 +4058,76 @@ func TestLlamaServerCompletionThinkingFormat(t *testing.T) {
 		t.Errorf("json format converted a schema, %d conversions", got)
 	}
 }
+
+func TestLlamaServerCompletionSendsMessageDelimiters(t *testing.T) {
+	for _, tt := range []struct {
+		name   string
+		prompt string
+		want   []any
+	}{
+		{
+			name:   "chatml",
+			prompt: "<|im_start|>system\nsys<|im_end|>\n<|im_start|>user\nhi<|im_end|>\n<|im_start|>assistant\n",
+			want: []any{
+				map[string]any{"role": "system", "delimiter": "<|im_start|>system"},
+				map[string]any{"role": "assistant", "delimiter": "<|im_start|>assistant"},
+				map[string]any{"role": "user", "delimiter": "<|im_start|>user"},
+			},
+		},
+		{
+			name:   "unknown format",
+			prompt: "test prompt",
+		},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			var completionBody map[string]any
+
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				switch r.URL.Path {
+				case "/health":
+					fmt.Fprint(w, `{"status":"ok"}`)
+				case "/completion":
+					if err := json.NewDecoder(r.Body).Decode(&completionBody); err != nil {
+						t.Errorf("invalid completion request body: %v", err)
+						return
+					}
+					w.Header().Set("Content-Type", "text/event-stream")
+					fmt.Fprintln(w, `data: {"content":"","stop":true}`)
+				default:
+					t.Errorf("unexpected path: %s", r.URL.Path)
+				}
+			}))
+			defer srv.Close()
+
+			parts := strings.Split(srv.URL, ":")
+			var portInt int
+			fmt.Sscanf(parts[len(parts)-1], "%d", &portInt)
+
+			runner := &llamaServerRunner{
+				port:    portInt,
+				cmd:     fakeRunningCmd(),
+				sem:     semaphore.NewWeighted(1),
+				options: api.Options{Runner: api.Runner{NumCtx: 2048}},
+			}
+
+			opts := api.DefaultOptions()
+			if err := runner.Completion(t.Context(), CompletionRequest{
+				Prompt:  tt.prompt,
+				Options: &opts,
+			}, func(CompletionResponse) {}); err != nil {
+				t.Fatalf("Completion error: %v", err)
+			}
+
+			got, ok := completionBody["message_delimiters"]
+			if tt.want == nil {
+				if ok {
+					t.Fatalf("message_delimiters = %v, want none", got)
+				}
+				return
+			}
+			if !reflect.DeepEqual(tt.want, got) {
+				t.Fatalf("message_delimiters = %v, want %v", got, tt.want)
+			}
+		})
+	}
+}

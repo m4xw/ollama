@@ -3566,7 +3566,7 @@ func truncateNativeChatMessages(ctx context.Context, m *Model, r llm.LlamaServer
 	currMsgIdx := 0
 	var system []api.Message
 
-	for i := 0; i <= lastMsgIdx; i++ {
+	for _, i := range truncationStarts(req.Messages, opts.NumCtx) {
 		system = system[:0]
 		for j := range i {
 			if req.Messages[j].Role == "system" {

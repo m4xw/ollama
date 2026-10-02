@@ -33,8 +33,9 @@ func chatPrompt(ctx context.Context, m *Model, tokenize tokenizeFunc, opts *api.
 	currMsgIdx := 0
 
 	if truncate {
-		// Start with all messages and remove from the front until it fits in context
-		for i := 0; i <= lastMsgIdx; i++ {
+		// Remove messages from the front until it fits in context, at the
+		// stable cut points truncationStarts picks
+		for _, i := range truncationStarts(msgs, opts.NumCtx) {
 			// Collect system messages from the portion we're about to skip
 			system = make([]api.Message, 0)
 			for j := range i {
@@ -89,6 +90,73 @@ func chatPrompt(ctx context.Context, m *Model, tokenize tokenizeFunc, opts *api.
 	}
 
 	return p, media, nil
+}
+
+// truncationBlocks is how many cut points a context's worth of conversation
+// has; charsPerToken turns that into a size in characters. Neither has to be
+// accurate - whether a cut fits is decided by tokenizing - they only have to
+// stay the same from one turn to the next.
+const (
+	truncationBlocks        = 4
+	truncationCharsPerToken = 4
+)
+
+// truncationStarts returns the message indexes a conversation that does not
+// fit in numCtx may start at, in the order to try them: 0 (nothing removed)
+// first, the last message last.
+//
+// Removing just enough to fit would cut one more message every turn, and every
+// such cut changes the prompt right after the system prompt: the whole rest of
+// it is re-processed, turn after turn, and models whose memory cannot be
+// rewound (recurrent, hybrid) do not even keep the system prompt. So the cuts
+// are placed every numCtx/truncationBlocks tokens of conversation, counted from
+// its start. Where they fall depends only on the messages before them, which
+// do not change as the conversation grows, so a conversation keeps its cut
+// until it outgrows it and then drops a whole block at once: the prompt is
+// re-processed once per block, not once per turn.
+//
+// A cut never starts the prompt at a tool result, which would lose the call it
+// answers. If no cut fits, every message after the last one is tried in turn,
+// as before.
+func truncationStarts(msgs []api.Message, numCtx int) []int {
+	starts := []int{0}
+	if len(msgs) == 0 {
+		return starts
+	}
+
+	block := max(numCtx*truncationCharsPerToken/truncationBlocks, 1)
+	next := block
+	size := 0
+	last := 0
+	for i, msg := range msgs {
+		if i > 0 && size >= next && msg.Role != "tool" && msg.Role != "system" {
+			starts = append(starts, i)
+			last = i
+			for next <= size {
+				next += block
+			}
+		}
+		if msg.Role != "system" {
+			size += truncationMessageSize(msg)
+		}
+	}
+
+	for i := last + 1; i < len(msgs); i++ {
+		starts = append(starts, i)
+	}
+	return starts
+}
+
+// truncationMessageSize estimates a message's size in characters. Thinking is
+// left out: clients and renderers drop it from earlier turns inconsistently,
+// and counting it would move the cuts when they do.
+func truncationMessageSize(msg api.Message) int {
+	size := len(msg.Content)
+	for _, call := range msg.ToolCalls {
+		size += len(call.Function.Name) + len(call.Function.Arguments.String())
+	}
+	// images are counted like chatPrompt counts them, 768 tokens each
+	return size + len(msg.Images)*768*truncationCharsPerToken
 }
 
 func imageTaggedMessages(m *Model, msgs []api.Message, start int, clearImages bool) ([]api.Message, []llm.MediaData, error) {

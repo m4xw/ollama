@@ -3,6 +3,8 @@ package server
 import (
 	"bytes"
 	"context"
+	"fmt"
+	"slices"
 	"strings"
 	"testing"
 
@@ -602,5 +604,114 @@ func TestRenderPromptResolvesDynamicGemma4Renderer(t *testing.T) {
 				t.Fatalf("rendered prompt mismatch (-got +want):\n%s", diff)
 			}
 		})
+	}
+}
+
+// A conversation that has outgrown the context keeps its cut point from one
+// turn to the next, so the prompt after the system prompt does not change every
+// turn; the cut only moves when the conversation no longer fits behind it.
+func TestChatPromptTruncationIsStable(t *testing.T) {
+	tmpl, err := template.Parse(`
+{{- if .System }}{{ .System }} {{ end }}
+{{- if .Prompt }}{{ .Prompt }} {{ end }}
+{{- if .Response }}{{ .Response }} {{ end }}`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	m := Model{Template: tmpl}
+	opts := api.Options{Runner: api.Runner{NumCtx: 200}}
+	think := false
+
+	tokenize := mockRunner{}.Tokenize
+	words := func(prefix string, n int) string {
+		return strings.TrimSpace(strings.Repeat(prefix+" ", n))
+	}
+
+	msgs := []api.Message{{Role: "system", Content: words("sys", 20)}}
+	prevCut, prevPrompt := -1, ""
+	truncatedTurns, cutMoves := 0, 0
+	for turn := range 60 {
+		msgs = append(msgs, api.Message{Role: "user", Content: words(fmt.Sprintf("u%d", turn), 8)})
+
+		prompt, _, err := chatPrompt(t.Context(), &m, tokenize, &opts, msgs, nil, &api.ThinkValue{Value: think}, true)
+		if err != nil {
+			t.Fatal(err)
+		}
+		tokens, _ := tokenize(t.Context(), prompt)
+		if len(tokens) > opts.NumCtx {
+			t.Fatalf("turn %d: prompt of %d tokens does not fit %d", turn, len(tokens), opts.NumCtx)
+		}
+		if !strings.HasPrefix(prompt, msgs[0].Content+" ") {
+			t.Fatalf("turn %d: system prompt was dropped: %q", turn, prompt)
+		}
+
+		// the first conversation message the prompt still holds
+		cut := 1
+		for cut < len(msgs) && !strings.Contains(prompt, msgs[cut].Content) {
+			cut++
+		}
+		if cut > 1 {
+			truncatedTurns++
+		}
+		if prevCut >= 0 && cut != prevCut {
+			if cut < prevCut {
+				t.Fatalf("turn %d: cut moved back from %d to %d", turn, prevCut, cut)
+			}
+			if prevCut > 1 {
+				cutMoves++
+			}
+			// it moved because the old cut no longer fits
+			old, _, err := chatPrompt(t.Context(), &m, tokenize, &opts, append([]api.Message{msgs[0]}, msgs[prevCut:]...), nil, &api.ThinkValue{Value: think}, false)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if n, _ := tokenize(t.Context(), old); len(n) <= opts.NumCtx {
+				t.Fatalf("turn %d: cut moved from %d to %d although %d still fits", turn, prevCut, cut, prevCut)
+			}
+		} else if prevCut >= 0 && !strings.HasPrefix(prompt, strings.TrimSuffix(prevPrompt, " ")) {
+			t.Fatalf("turn %d: same cut, but the prompt does not extend the previous one", turn)
+		}
+		prevCut, prevPrompt = cut, prompt
+
+		msgs = append(msgs, api.Message{Role: "assistant", Content: words(fmt.Sprintf("a%d", turn), 8)})
+	}
+
+	if truncatedTurns < 30 {
+		t.Fatalf("only %d turns were truncated, the test does not exercise truncation", truncatedTurns)
+	}
+	// a turn is ~1/12 of the context here and a block 1/4, so the cut moves
+	// about every third turn; cutting just enough would move it every turn
+	if cutMoves*3 > truncatedTurns {
+		t.Fatalf("cut moved %d times over %d truncated turns", cutMoves, truncatedTurns)
+	}
+}
+
+func TestTruncationStarts(t *testing.T) {
+	msgs := []api.Message{
+		{Role: "system", Content: strings.Repeat("s", 500)},
+		{Role: "user", Content: strings.Repeat("u", 60)},
+		{Role: "assistant", Content: strings.Repeat("a", 60)},
+		{Role: "tool", Content: strings.Repeat("t", 60)},
+		{Role: "assistant", Content: strings.Repeat("a", 60)},
+		{Role: "user", Content: strings.Repeat("u", 60)},
+		{Role: "assistant", Content: strings.Repeat("a", 10)},
+	}
+
+	// block = 100 chars: crossed before message 3 (a tool result, skipped) and
+	// taken at 4, then crossed again before 5 and before 6
+	got := truncationStarts(msgs, 100)
+	want := []int{0, 4, 5, 6}
+	if diff := cmp.Diff(want, got); diff != "" {
+		t.Errorf("truncationStarts mismatch (-want +got):\n%s", diff)
+	}
+
+	// adding messages does not move the cuts already there
+	grown := append(slices.Clone(msgs), api.Message{Role: "user", Content: strings.Repeat("u", 500)})
+	if got := truncationStarts(grown, 100); !slices.Equal(got[:len(want)], want) {
+		t.Errorf("cuts moved as the conversation grew: %v", got)
+	}
+
+	if got := truncationStarts(nil, 100); !slices.Equal(got, []int{0}) {
+		t.Errorf("empty conversation: %v", got)
 	}
 }

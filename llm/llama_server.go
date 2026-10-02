@@ -405,8 +405,9 @@ func startLlamaServer(launch llamaServerLaunchConfig, out io.Writer) (cmd *exec.
 		params = append(params,
 			"-np", strconv.Itoa(launch.numParallel),
 			"--cont-batching",
-			"--no-kv-unified",
+			"--kv-unified",
 			"--spec-type", "none",
+			"--swa-full",
 			// Displaced prompts are parked in host memory and read back when they
 			// return, so a background task taking the slot over does not cost the
 			// conversation its prefill. See envconfig.PromptCacheRAM.
@@ -1493,6 +1494,39 @@ type llamaServerCompletionRequest struct {
 	NProbs          int             `json:"n_probs,omitempty"`
 	PreservedTokens []string        `json:"preserved_tokens,omitempty"`
 	TimingsPerToken bool            `json:"timings_per_token,omitempty"`
+
+	MessageDelimiters []llamaServerMessageDelimiter `json:"message_delimiters,omitempty"`
+}
+
+// llamaServerMessageDelimiter marks where a message of a role starts in a
+// rendered prompt. llama-server places its context checkpoints at those
+// starts; it learns them from the chat template on its own chat endpoint, but
+// a prompt Ollama rendered comes with none.
+type llamaServerMessageDelimiter struct {
+	Role      string `json:"role"`
+	Delimiter string `json:"delimiter"`
+}
+
+// llamaServerMessageDelimiters returns the delimiters for a prompt Ollama
+// rendered, or nil when its format is not known.
+//
+// Without them a model whose memory cannot be rewound (recurrent, hybrid, SWA)
+// gets checkpoints only near the end of each prompt, so a prompt that differs
+// from the last one anywhere earlier - a new conversation, or one truncated
+// from the front, both sharing only the system prompt - is re-processed from
+// the start. With them llama-server also checkpoints the end of the system
+// prompt and user turns. Tool results are left to count as user turns: in an
+// agent loop they are nearly all of them. A wrong guess costs nothing but
+// checkpoint placement.
+func llamaServerMessageDelimiters(prompt string) []llamaServerMessageDelimiter {
+	if !strings.Contains(prompt, "<|im_start|>") {
+		return nil
+	}
+	return []llamaServerMessageDelimiter{
+		{Role: "system", Delimiter: "<|im_start|>system"},
+		{Role: "assistant", Delimiter: "<|im_start|>assistant"},
+		{Role: "user", Delimiter: "<|im_start|>user"},
+	}
 }
 
 // schemaGrammars caches the grammars llama-server derives from JSON schemas,
@@ -1738,6 +1772,8 @@ func (s *llamaServerRunner) Completion(ctx context.Context, req CompletionReques
 		TypicalP:        req.Options.TypicalP,
 		Seed:            req.Options.Seed,
 		PreservedTokens: llamaServerPreservedTokens(req.PreservedTokens, req.ToolCallTag),
+
+		MessageDelimiters: llamaServerMessageDelimiters(req.Prompt),
 	}
 
 	if req.Logprobs {

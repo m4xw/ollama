@@ -556,6 +556,68 @@ func TestFromMessagesRequest_WithToolResultFollowedByUserText(t *testing.T) {
 	}
 }
 
+func TestFromMessagesRequest_FoldsSystemMessagesIntoUserTurns(t *testing.T) {
+	text := func(role, s string) MessageParam {
+		return MessageParam{Role: role, Content: []ContentBlock{{Type: "text", Text: ptr(s)}}}
+	}
+
+	// The layout Claude Code sends: an environment block after the first user
+	// turn and another system message after the latest one.
+	req := MessagesRequest{
+		Model:     "test-model",
+		MaxTokens: 1024,
+		System:    "You are a coding agent.",
+		Messages: []MessageParam{
+			text("user", "Say hi"),
+			text("system", "# Environment"),
+			text("assistant", "Hi!"),
+			text("user", "Now read note.txt"),
+			text("system", "<total_tokens>"),
+		},
+	}
+
+	result, err := FromMessagesRequest(req)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	want := []api.Message{
+		{Role: "system", Content: "You are a coding agent."},
+		{Role: "user", Content: "# Environment\n\nSay hi"},
+		{Role: "assistant", Content: "Hi!"},
+		{Role: "user", Content: "<total_tokens>\n\nNow read note.txt"},
+	}
+	if diff := cmp.Diff(want, result.Messages); diff != "" {
+		t.Fatalf("messages mismatch (-want +got):\n%s", diff)
+	}
+}
+
+func TestFromMessagesRequest_SystemMessageWithoutUserTurnBecomesUser(t *testing.T) {
+	req := MessagesRequest{
+		Model:     "test-model",
+		MaxTokens: 1024,
+		Messages: []MessageParam{
+			{Role: "system", Content: []ContentBlock{{Type: "text", Text: ptr("leading")}}},
+			{Role: "assistant", Content: []ContentBlock{{Type: "text", Text: ptr("Hi!")}}},
+			{Role: "system", Content: []ContentBlock{{Type: "text", Text: ptr("after assistant")}}},
+		},
+	}
+
+	result, err := FromMessagesRequest(req)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	want := []api.Message{
+		{Role: "system", Content: "leading"},
+		{Role: "assistant", Content: "Hi!"},
+		{Role: "user", Content: "after assistant"},
+	}
+	if diff := cmp.Diff(want, result.Messages); diff != "" {
+		t.Fatalf("messages mismatch (-want +got):\n%s", diff)
+	}
+}
+
 func TestFromMessagesRequest_WithOutputConfigEffort(t *testing.T) {
 	req := MessagesRequest{
 		Model:     "gemma4",

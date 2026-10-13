@@ -400,6 +400,7 @@ func FromMessagesRequestWithCache(r MessagesRequest, thinking ...*model.Thinking
 		}
 		messages = append(messages, converted...)
 	}
+	messages = foldSystemMessages(messages)
 
 	options := make(map[string]any)
 
@@ -467,6 +468,43 @@ func FromMessagesRequestWithCache(r MessagesRequest, thinking ...*model.Thinking
 		"cache_breakpoints", promptCache.Breakpoints())
 
 	return convertedRequest, promptCache, nil
+}
+
+// foldSystemMessages moves every system message that is not the first message
+// into the user turn before it.
+//
+// Claude Code sends system messages inside `messages`: its environment block
+// after the first user turn, and another after the latest one. Chat templates
+// render those as a system turn just ahead of the assistant prompt, and small
+// models then answer that turn instead of the user, ignoring the task and the
+// tools. Folded in ahead of the user's own text, the user's request stays the
+// last thing before the reply. Earlier turns keep their rendered bytes as the
+// conversation grows, so the cached prefix still matches.
+//
+// A system message with no user turn right before it becomes a user turn.
+func foldSystemMessages(messages []api.Message) []api.Message {
+	out := make([]api.Message, 0, len(messages))
+	for i, m := range messages {
+		if m.Role != "system" || i == 0 {
+			out = append(out, m)
+			continue
+		}
+
+		if n := len(out); n > 0 && out[n-1].Role == "user" {
+			prev := &out[n-1]
+			if prev.Content == "" {
+				prev.Content = m.Content
+			} else if m.Content != "" {
+				prev.Content = m.Content + "\n\n" + prev.Content
+			}
+			prev.Images = append(m.Images, prev.Images...)
+			continue
+		}
+
+		m.Role = "user"
+		out = append(out, m)
+	}
+	return out
 }
 
 // thinkFromThinkingConfig derives the Ollama think value from Anthropic's two

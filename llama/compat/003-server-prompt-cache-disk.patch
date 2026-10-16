@@ -1,6 +1,7 @@
 server : keep the prompt cache on disk, one file per prompt (--cache-disk)
 
-Ollama-local, applies after 002-server-slot-checkpoints.patch. With --cache-disk DIR the
+Ollama-local, applies on top of 001-llama-cpp-hooks.patch (the former 002-server-slot-checkpoints
+landed upstream as #26004 and is part of b11669). With --cache-disk DIR the
 prompt cache writes every entry to its own file under DIR and keeps only its tokens in
 memory. Entries survive a restart (the directory is indexed at load), are not
 size-limited, and are removed only when a newer prompt contains them. In disk mode a
@@ -20,11 +21,11 @@ only the system prompt with the slot, and resumes from that checkpoint instead o
 re-processing everything.
 
 diff --git a/common/arg.cpp b/common/arg.cpp
-index 79405b5..79184de 100644
+index 8b302d5d7..793e89c59 100644
 --- a/common/arg.cpp
 +++ b/common/arg.cpp
-@@ -1717,6 +1717,14 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
-             params.cache_ram_mib = value;
+@@ -1724,6 +1724,14 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
+             params.cache_ram_explicit = true;
          }
      ).set_env("LLAMA_ARG_CACHE_RAM").set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}));
 +    add_opt(common_arg(
@@ -39,10 +40,10 @@ index 79405b5..79184de 100644
          {"-kvu", "--kv-unified"},
          {"-no-kvu", "--no-kv-unified"},
 diff --git a/common/common.h b/common/common.h
-index 4e9448b..39e49b1 100644
+index 2cd6e2ec9..fdfc27454 100644
 --- a/common/common.h
 +++ b/common/common.h
-@@ -689,6 +689,7 @@ struct common_params {
+@@ -701,6 +701,7 @@ struct common_params {
      bool log_json = false;
  
      std::string slot_save_path;
@@ -51,30 +52,25 @@ index 4e9448b..39e49b1 100644
  
      float slot_prompt_similarity = 0.1f;
 diff --git a/tools/server/server-context.cpp b/tools/server/server-context.cpp
-index 7fdaa8c..a81c207 100644
+index a18b7542c..8e14fd02f 100644
 --- a/tools/server/server-context.cpp
 +++ b/tools/server/server-context.cpp
-@@ -319,6 +319,18 @@ struct server_slot {
+@@ -328,6 +328,13 @@ struct server_slot {
              llama_state_seq_get_data_ext(ctx_dft, cur->data.drft.data(), cur_size_dft, id, LLAMA_STATE_SEQ_FLAGS_NONE);
          }
  
 +        // disk mode: the write happens here, on the server loop, so a large state stalls the other
 +        // slots for as long as the write takes - acceptable, the alternative is a full re-prefill
-+        if (prompt_cache.disk_enabled()) {
-+            const bool ok = prompt_cache.spill(*cur);
-+            if (!ok) {
-+                prompt_cache.erase(std::prev(prompt_cache.states.end()));
-+            }
-+            // the entries this one replaces are removed only now that it is on disk
-+            prompt_cache.settle_obsolete(ok);
-+            return ok;
++        if (prompt_cache.disk_enabled() && !prompt_cache.spill(*cur)) {
++            prompt_cache.erase(std::prev(prompt_cache.states.end()));
++            return false;
 +        }
 +
          return true;
      }
  
-@@ -1348,7 +1360,14 @@ private:
-             batch.init(std::max(n_batch, params_base.n_parallel), n_embd);
+@@ -1497,7 +1504,14 @@ private:
+             params_base.cache_idle_slots = false;
          }
  
 -        if (params_base.cache_ram_mib != 0) {
@@ -89,7 +85,7 @@ index 7fdaa8c..a81c207 100644
              if (params_base.cache_ram_mib < 0) {
                  SRV_TRC("prompt cache is enabled, size limit: %s\n", "no limit");
              } else {
-@@ -1418,8 +1437,8 @@ private:
+@@ -1567,8 +1581,8 @@ private:
          metrics.init();
  
          if (params_base.cache_idle_slots) {
@@ -100,11 +96,11 @@ index 7fdaa8c..a81c207 100644
                  params_base.cache_idle_slots = false;
              } else {
                  if (params_base.kv_unified) {
-@@ -1622,6 +1641,17 @@ private:
+@@ -1776,6 +1790,17 @@ private:
              }
          }
  
-+        if (ret && prompt_cache && prompt_cache->disk_enabled() && task.type == SERVER_TASK_TYPE_COMPLETION) {
++        if (ret && prompt_cache && prompt_cache->disk_enabled() && !task.is_stateless()) {
 +            // disk mode: an entry costs no memory, so the slot is saved whenever more than a ubatch of it would be
 +            // lost, or when a cached prompt matches the task better and replaces it. a smaller divergence is the
 +            // usual re-rendering of the last turn: the tail is re-processed in about one ubatch (and the slot keeps
@@ -118,72 +114,8 @@ index 7fdaa8c..a81c207 100644
          if (ret) {
              update_cache = update_cache && prompt_cache;
  
-@@ -2315,13 +2345,19 @@ private:
-         }
- 
-         while (slot.prompt.checkpoints.size() >= (size_t) params_base.n_ctx_checkpoints) {
--            // make room for the new checkpoint, if needed
--            const auto & cur = slot.prompt.checkpoints.front();
-+            // make room for the new checkpoint, if needed. the earliest checkpoint is kept: it is usually the end of
-+            // the system prompt, the only place a prompt truncated from the front (or a new conversation) can
-+            // resume from, so the oldest one after it goes instead
-+            auto it = slot.prompt.checkpoints.begin();
-+            if (slot.prompt.checkpoints.size() > 1) {
-+                ++it;
-+            }
-+            const auto & cur = *it;
- 
-             SLT_WRN(slot, "erasing old context checkpoint (pos_min = %d, pos_max = %d, n_tokens = %" PRId64 ", size = %.3f MiB)\n",
-                     cur.pos_min, cur.pos_max, cur.n_tokens, (float) cur.size() / 1024 / 1024);
- 
--            slot.prompt.checkpoints.erase(slot.prompt.checkpoints.begin());
-+            slot.prompt.checkpoints.erase(it);
-         }
- 
-         auto & cur = slot.prompt.checkpoints.emplace_back();
-@@ -3609,6 +3645,15 @@ private:
-                     const auto & spans = slot.task->params.message_spans;
-                     const auto last_user_pos = spans.last_user_message_pos();
- 
-+                    // the end of a leading system message is checkpointed like a user message: a prompt truncated
-+                    // from the front keeps only the system prompt, and whatever follows it (a user message, a tool
-+                    // result or an assistant turn) has to find a checkpoint right there
-+                    const int32_t base_pos = spans.spans.size() > 1 && spans.spans.front().role == COMMON_CHAT_ROLE_SYSTEM ?
-+                        (int32_t) spans.spans[1].pos : -1;
-+                    const auto is_ckpt_start = [&](int32_t pos) {
-+                        return pos == base_pos || spans.is_user_start(pos);
-+                    };
-+
-                     // add prompt tokens for processing in the current batch
-                     while (slot.prompt.n_tokens() < slot.task->n_tokens() && batch.size() < n_batch) {
-                         // get next token to process
-@@ -3636,11 +3681,11 @@ private:
-                         slot.prompt.tokens.push_back(cur_tok);
- 
-                         // break at the last user message, or at user messages at least min step past the last checkpoint
--                        if (do_checkpoint && spans.is_user_start(slot.prompt.n_tokens())) {
-+                        if (do_checkpoint && is_ckpt_start(slot.prompt.n_tokens())) {
-                             const auto pos = slot.prompt.n_tokens();
-                             const auto & checkpoints = slot.prompt.checkpoints;
- 
--                            if (pos == last_user_pos || checkpoints.empty() || pos > checkpoints.back().n_tokens + params_base.checkpoint_min_step) {
-+                            if (pos == last_user_pos || pos == base_pos || checkpoints.empty() || pos > checkpoints.back().n_tokens + params_base.checkpoint_min_step) {
-                                 break;
-                             }
-                         }
-@@ -3674,8 +3719,8 @@ private:
- 
-                     const bool near_prompt_end = slot.task->n_tokens() < slot.prompt.n_tokens() + n_ubatch;
- 
--                    const bool is_user_start = spans.is_user_start(n_tokens_start);
--                    const bool is_last_user_message = n_tokens_start == last_user_pos;
-+                    const bool is_user_start = is_ckpt_start(n_tokens_start);
-+                    const bool is_last_user_message = n_tokens_start == last_user_pos || n_tokens_start == base_pos;
- 
-                     // entire prompt has been processed
-                     if (slot.prompt.n_tokens() == slot.task->n_tokens()) {
 diff --git a/tools/server/server-task.cpp b/tools/server/server-task.cpp
-index 0d3beb3..655c25b 100644
+index 3f30da2cd..e4357ef06 100644
 --- a/tools/server/server-task.cpp
 +++ b/tools/server/server-task.cpp
 @@ -10,6 +10,9 @@
@@ -196,7 +128,7 @@ index 0d3beb3..655c25b 100644
  #include <sstream>
  
  //
-@@ -1708,7 +1711,317 @@ size_t server_prompt_cache::n_tokens() const {
+@@ -1711,7 +1714,300 @@ size_t server_prompt_cache::n_tokens() const {
      return res;
  }
  
@@ -438,29 +370,13 @@ index 0d3beb3..655c25b 100644
 +    return true;
 +}
 +
-+static void prompt_disk_remove(const std::string & path) {
-+    if (!path.empty()) {
-+        std::error_code ec;
-+        std::filesystem::remove(std::filesystem::u8path(path), ec);
-+        SRV_TRC(" - removed prompt cache file '%s'\n", path.c_str());
-+    }
-+}
-+
 +std::list<server_prompt_cache_state>::iterator server_prompt_cache::erase(std::list<server_prompt_cache_state>::iterator it) {
-+    prompt_disk_remove(it->path);
++    if (!it->path.empty()) {
++        std::error_code ec;
++        std::filesystem::remove(std::filesystem::u8path(it->path), ec);
++        SRV_TRC(" - removed prompt cache file '%s'\n", it->path.c_str());
++    }
 +    return states.erase(it);
-+}
-+
-+void server_prompt_cache::settle_obsolete(bool published) {
-+    if (!published) {
-+        // nothing replaced them, so they are still the best there is; they are older than any other entry
-+        states.splice(states.begin(), obsolete_states);
-+        return;
-+    }
-+    for (const auto & state : obsolete_states) {
-+        prompt_disk_remove(state.path);
-+    }
-+    obsolete_states.clear();
 +}
 +
 +bool server_prompt_cache::load_disk(std::list<server_prompt_cache_state>::iterator it, server_prompt & prompt, llama_context * ctx_tgt, llama_context * ctx_dft, int32_t id_slot) {
@@ -489,9 +405,8 @@ index 0d3beb3..655c25b 100644
 +        return false;
 +    }
 +
-+    // like create_checkpoint(), keep the earliest checkpoint (the end of the system prompt) when trimming
 +    while (checkpoints.size() > (size_t) std::max(n_ctx_checkpoints, 0)) {
-+        checkpoints.erase(checkpoints.size() > 1 ? std::next(checkpoints.begin()) : checkpoints.begin());
++        checkpoints.pop_front();
 +    }
 +
 +    SRV_INF("prompt cache: restored %zu tokens, %zu checkpoints from '%s' in %.2f ms\n",
@@ -514,7 +429,7 @@ index 0d3beb3..655c25b 100644
      // first check if the current state is contained fully in the cache
      for (auto it = states.begin(); it != states.end(); ++it) {
          const int cur_lcp_len = it->prompt.tokens.get_common_prefix(prompt.tokens);
-@@ -1738,10 +2051,42 @@ server_prompt_cache_state * server_prompt_cache::alloc(const server_prompt & pro
+@@ -1741,10 +2037,32 @@ server_prompt_cache_state * server_prompt_cache::alloc(const server_prompt & pro
      for (auto it = states.begin(); it != states.end();) {
          const int len = it->prompt.tokens.get_common_prefix(prompt.tokens);
  
@@ -526,11 +441,9 @@ index 0d3beb3..655c25b 100644
 +        // disk mode: also drop an entry that the new prompt can resume to within its last ubatch of tokens, or
 +        // every turn of a conversation would leave a file behind (the last turn is re-rendered differently than
 +        // it was generated). a memory that cannot be truncated resumes only from a checkpoint, so it has to
-+        // hold one that close to the entry's end - that goes for an entry the new prompt contains, too: the
-+        // new state cannot be rewound to it, and a short entry (a system prompt, say) is exactly what a prompt
-+        // truncated from the front or a new conversation resumes from. at least half of a partially matching
-+        // entry has to be shared, so short entries are not dropped for any new prompt
-+        if (disk_enabled() && (obsolete ? needs_checkpoints : 2*len >= n_old)) {
++        // hold one that close to the entry's end. at least half of the entry has to be shared, so short
++        // entries are not dropped for any new prompt
++        if (!obsolete && disk_enabled() && 2*len >= n_old) {
 +            int n_resume = len;
 +            if (needs_checkpoints) {
 +                n_resume = 0;
@@ -543,15 +456,7 @@ index 0d3beb3..655c25b 100644
 +            obsolete = n_resume + n_ubatch >= n_old;
 +        }
 +
-+        if (obsolete && disk_enabled()) {
-+            SRV_TRC(" - cached prompt with length %d is obsolete, removing it once the new one is written\n", n_old);
-+
-+            // the file is kept until the entry replacing it is on disk: a process killed during that write
-+            // would otherwise have lost both
-+            const auto next = std::next(it);
-+            obsolete_states.splice(obsolete_states.end(), states, it);
-+            it = next;
-+        } else if (obsolete) {
++        if (obsolete) {
              SRV_TRC(" - removing obsolete cached prompt with length %d\n", len);
  
 -            it = states.erase(it);
@@ -559,20 +464,19 @@ index 0d3beb3..655c25b 100644
          } else {
              ++it;
          }
-@@ -1767,6 +2112,12 @@ server_prompt_cache_state * server_prompt_cache::alloc(const server_prompt & pro
+@@ -1770,6 +2088,11 @@ server_prompt_cache_state * server_prompt_cache::alloc(const server_prompt & pro
      } catch (const std::bad_alloc & e) {
          SRV_ERR("failed to allocate memory for prompt cache state: %s\n", e.what());
  
 +        if (disk_enabled()) {
 +            // entries on disk hold no memory, shrinking the limit would only evict them
-+            settle_obsolete(false);
 +            return nullptr;
 +        }
 +
          limit_size = std::max<size_t>(1, 0.4*size());
  
          SRV_WRN(" - cache size limit reduced to %.3f MiB\n", limit_size / (1024.0 * 1024.0));
-@@ -1790,7 +2141,7 @@ server_prompt_cache_state * server_prompt_cache::alloc(const server_prompt & pro
+@@ -1793,7 +2116,7 @@ server_prompt_cache_state * server_prompt_cache::alloc(const server_prompt & pro
      return &states.back();
  }
  
@@ -581,7 +485,7 @@ index 0d3beb3..655c25b 100644
      const int lcp_best = prompt.tokens.get_common_prefix(tokens_new);
  
      float f_keep_best = prompt.tokens.size() > 0 ? float(lcp_best) / prompt.tokens.size() : -1.0f; // empty slot: any cache entry wins
-@@ -1824,6 +2175,18 @@ bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tok
+@@ -1827,6 +2150,18 @@ bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tok
  
      if (it_best != states.end()) {
          SRV_TRC(" - found better prompt with f_keep = %.3f, f_sim = %.3f\n", f_keep_best, f_sim_best);
@@ -601,10 +505,10 @@ index 0d3beb3..655c25b 100644
          {
              auto & data = it_best->data.main;
 diff --git a/tools/server/server-task.h b/tools/server/server-task.h
-index 9c99143..f8370ad 100644
+index e7bb04398..ea21e5dde 100644
 --- a/tools/server/server-task.h
 +++ b/tools/server/server-task.h
-@@ -598,6 +598,9 @@ struct server_prompt_cache_state {
+@@ -654,6 +654,9 @@ struct server_prompt_cache_state {
      server_prompt prompt;
      server_prompt_data data;
  
@@ -614,7 +518,7 @@ index 9c99143..f8370ad 100644
      size_t size() const {
          size_t res = data.size();
  
-@@ -631,7 +634,44 @@ struct server_prompt_cache {
+@@ -687,7 +690,37 @@ struct server_prompt_cache {
  
      bool load(server_prompt & prompt, const server_tokens & tokens_new, llama_context * ctx_tgt, llama_context * ctx_dft, int32_t id_slot);
  
@@ -642,14 +546,7 @@ index 9c99143..f8370ad 100644
 +    // erase an entry, together with its file
 +    std::list<server_prompt_cache_state>::iterator erase(std::list<server_prompt_cache_state>::iterator it);
 +
-+    // disk mode: alloc() sets the entries a new one makes obsolete aside instead of removing their files, so a
-+    // process killed while the new entry is written still has them. once the write is done this removes them
-+    // (published) or puts them back (the write failed)
-+    void settle_obsolete(bool published);
-+
 +private:
-+    std::list<server_prompt_cache_state> obsolete_states;
-+
 +    int32_t n_ctx_checkpoints = 0;
 +    int32_t n_ubatch          = 0;
 +    bool    needs_checkpoints = false;

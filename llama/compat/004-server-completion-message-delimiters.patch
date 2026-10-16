@@ -1,0 +1,46 @@
+server : accept message_delimiters on /completion again
+
+Ollama-local, applies after 003-server-prompt-cache-disk.patch. llama.cpp b10760
+accepted a `message_delimiters` array on /completion, which llm/llama_server.go sends
+for a prompt Ollama rendered itself so llama-server checkpoints the end of the system
+prompt and of each user turn (stable truncation on memories that cannot be rewound).
+The chat API refactor (#30210) moved the delimiters into common_chat_session, which a
+pre-rendered /completion prompt never has, so the field was silently ignored. This
+parses it again when the request carries no chat template.
+
+diff --git a/tools/server/server-context.cpp b/tools/server/server-context.cpp
+index 8e14fd02f..f5322e423 100644
+--- a/tools/server/server-context.cpp
++++ b/tools/server/server-context.cpp
+@@ -4953,6 +4953,20 @@ std::unique_ptr<server_res_generator> server_routes::handle_completions_impl(
+ 
+         // tasks.reserve(inputs.size()); // TODO: this is inaccurate due to child tasks
+ 
++        // ollama compat: a pre-rendered /completion prompt has no chat session, so the caller
++        // names the message delimiters itself; they place the context checkpoints the same way
++        // the chat template does (b10760 accepted this field upstream, b11669 moved it into
++        // common_chat_session)
++        common_chat_msg_delimiters delimiters;
++        if (!chat_session.has_template() && data.contains("message_delimiters") && data.at("message_delimiters").is_array()) {
++            for (const auto & d : data.at("message_delimiters")) {
++                if (d.is_object()) {
++                    delimiters.add(common_chat_role_from_string(d.value("role", std::string())), d.value("delimiter", std::string()));
++                }
++            }
++            delimiters.tokenize(ctx_server.vocab);
++        }
++
+         for (size_t i = 0; i < inputs.size(); i++) {
+             server_task task = server_task(type);
+ 
+@@ -4967,6 +4981,10 @@ std::unique_ptr<server_res_generator> server_routes::handle_completions_impl(
+ 
+             task.apply_chat_session(chat_session);
+ 
++            if (!delimiters.delimiters.empty()) {
++                task.params.message_spans = task.tokens.find_message_spans(delimiters);
++            }
++
+             task.id_slot = json_value(data, "id_slot", -1);
+             sse_ping_interval = task.params.sse_ping_interval;
+ 

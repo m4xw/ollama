@@ -209,6 +209,7 @@ type llamaServerLaunchConfig struct {
 	gpuLibs              []string
 	extraEnvs            map[string]string
 	forceNoMMProjOffload bool
+	hostExperts          hostExpertsPlan
 }
 
 func newLlamaServerHTTPClient() *http.Client {
@@ -406,6 +407,7 @@ func startLlamaServer(launch llamaServerLaunchConfig, out io.Writer) (cmd *exec.
 			"-np", strconv.Itoa(launch.numParallel),
 			"--cont-batching",
 			"--kv-unified",
+			//"--fit", "on",
 			"--spec-type", "none",
 			"--swa-full",
 			// Displaced prompts are parked in host memory and read back when they
@@ -439,7 +441,11 @@ func startLlamaServer(launch llamaServerLaunchConfig, out io.Writer) (cmd *exec.
 		params = append(params, "--lora", adapter)
 	}
 
+	// Diversion on purpose: set NumBatch based on the u-batch calculation.
+	launch.opts.NumBatch = llamaServerUBatch(launch.opts, launch.hostExperts)
+
 	params = appendLoadModeArgs(params, launch.opts, launch.gpus)
+	params = append(params, hostExpertsArgs(launch.hostExperts)...)
 
 	// KV cache type
 	if launch.kvCacheType != "" {
@@ -448,7 +454,7 @@ func startLlamaServer(launch llamaServerLaunchConfig, out io.Writer) (cmd *exec.
 
 	params = appendFlashAttentionArgs(params, launch.gpus)
 
-	params = appendBatchArgs(params, launch.opts, launch.embedding, launch.numParallel)
+	params = appendBatchArgs(params, launch.opts, launch.embedding, launch.numParallel, launch.opts.NumBatch) //llamaServerUBatch(launch.opts, launch.hostExperts))
 
 	// GPU layer offloading — only pass if user explicitly set it (non-default).
 	// Default behavior: let llama-server auto-detect via -ngl auto.
@@ -636,7 +642,23 @@ func appendLlamaServerLogArgs(params []string) []string {
 	)
 }
 
-func appendBatchArgs(params []string, opts api.Options, embedding bool, numParallel int) []string {
+// llamaServerUBatch is the physical batch size (-ub). It only ever shrinks
+// below the logical batch (-b): the compute buffers scale with it
+func llamaServerUBatch(opts api.Options, hostExperts hostExpertsPlan) int {
+	if opts.NumBatch <= 0 {
+		return 0
+	}
+	ubatch := envconfig.NumUBatch()
+	if ubatch <= 0 && hostExperts.enabled {
+		ubatch = 512
+	}
+	if ubatch <= 0 || ubatch > opts.NumBatch {
+		return ubatch
+	}
+	return ubatch
+}
+
+func appendBatchArgs(params []string, opts api.Options, embedding bool, numParallel int, ubatch int) []string {
 	if embedding {
 		params = append(params, "--embedding")
 		if batchSize := embeddingBatchSize(opts, numParallel); batchSize > 0 {
@@ -646,7 +668,10 @@ func appendBatchArgs(params []string, opts api.Options, embedding bool, numParal
 	}
 
 	if opts.NumBatch > 0 {
-		params = append(params, "-b", strconv.Itoa(opts.NumBatch), "-ub", strconv.Itoa(opts.NumBatch))
+		if ubatch <= 0 || ubatch > opts.NumBatch {
+			ubatch = opts.NumBatch
+		}
+		params = append(params, "-b", strconv.Itoa(opts.NumBatch), "-ub", strconv.Itoa(ubatch))
 	}
 	return params
 }
@@ -724,6 +749,11 @@ func (launch llamaServerLaunchConfig) mmprojOffloadDisabled() (bool, string) {
 	}
 	if launch.forceNoMMProjOffload {
 		return true, "startup-oom-retry"
+	}
+	if launch.hostExperts.enabled && launch.hostExperts.cacheMiB > 0 {
+		// the projector runs once per image; the same VRAM as expert cache
+		// is used on every token
+		return true, "host-experts"
 	}
 	return shouldDisableMMProjOffload(launch.opts, launch.gpus, launch.modelLayers, launch.mmprojMemory)
 }
@@ -1004,6 +1034,7 @@ func NewLlamaServerRunner(
 		gpus:         slices.Clone(gpus),
 		gpuLibs:      slices.Clone(gpuLibs),
 		extraEnvs:    cloneStringMap(serverEnvs),
+		hostExperts:  planHostExperts(f, gpus, opts, numParallel, kvCacheType, config.DraftModelPath),
 	}
 
 	s := &llamaServerRunner{

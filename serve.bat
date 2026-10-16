@@ -33,7 +33,7 @@ REM One slot: the hybrid architectures do not support parallel requests, and a
 REM second slot doubles the context allocation for nothing.
 set OLLAMA_NUM_PARALLEL=1
 set OLLAMA_MAX_LOADED_MODELS=1
-set OLLAMA_NUM_BATCH=4096
+set OLLAMA_NUM_BATCH=2048
 set LLAMA_ATTN_ROT_DISABLE=1
 
 REM --- model -------------------------------------------------------------
@@ -41,7 +41,6 @@ if "%OLLAMA_KEEP_ALIVE%"=="" set OLLAMA_KEEP_ALIVE=-1
 if "%OLLAMA_CONTEXT_LENGTH%"=="" set OLLAMA_CONTEXT_LENGTH=131072
 if "%OLLAMA_FLASH_ATTENTION%"=="" set OLLAMA_FLASH_ATTENTION=1
 if "%OLLAMA_KV_CACHE_TYPE%"=="" set OLLAMA_KV_CACHE_TYPE=q4_0
-umg
 REM --- server -------------------------------------------------------------
 if "%OLLAMA_HOST%"=="" set OLLAMA_HOST=127.0.0.1:11434
 

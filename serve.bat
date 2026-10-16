@@ -33,13 +33,21 @@ REM One slot: the hybrid architectures do not support parallel requests, and a
 REM second slot doubles the context allocation for nothing.
 set OLLAMA_NUM_PARALLEL=1
 set OLLAMA_MAX_LOADED_MODELS=1
-set OLLAMA_NUM_BATCH=2048
+REM Deprecated: set OLLAMA_NUM_BATCH=8192
+set OLLAMA_NUM_UBATCH=2048
 set LLAMA_ATTN_ROT_DISABLE=1
 
 REM --- model -------------------------------------------------------------
 if "%OLLAMA_KEEP_ALIVE%"=="" set OLLAMA_KEEP_ALIVE=-1
-if "%OLLAMA_CONTEXT_LENGTH%"=="" set OLLAMA_CONTEXT_LENGTH=131072
+if "%OLLAMA_CONTEXT_LENGTH%"=="" set OLLAMA_CONTEXT_LENGTH=262144
 if "%OLLAMA_FLASH_ATTENTION%"=="" set OLLAMA_FLASH_ATTENTION=1
+if "%OLLAMA_CPU_MOE%"=="" set OLLAMA_CPU_MOE=1
+
+REM Nemotron-H hybrids only have a KV cache on their few attention layers (8 of
+REM 88 on Bolt: ~0.5 GiB at 128k in q8_0), so q4_0 saves ~250 MiB for a real
+REM quality cost. The experts live in host memory (llm/host_experts.go), the
+REM VRAM that is left becomes a GPU LRU of hot experts: OLLAMA_MOE_CACHE_MIB
+REM overrides the automatic size, OLLAMA_CPU_MOE=0 turns the whole thing off.
 if "%OLLAMA_KV_CACHE_TYPE%"=="" set OLLAMA_KV_CACHE_TYPE=q4_0
 REM --- server -------------------------------------------------------------
 if "%OLLAMA_HOST%"=="" set OLLAMA_HOST=127.0.0.1:11434

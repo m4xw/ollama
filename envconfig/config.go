@@ -139,6 +139,45 @@ func PromptCacheDir() string {
 //
 // The default is 8192 MiB, or 0 when OLLAMA_PROMPT_CACHE_DIR is set and the
 // cache is kept on disk instead.
+// CPUMoE decides where the experts of a Mixture-of-Experts model live:
+// "" (auto, the default) keeps them in host memory only when they do not fit
+// the GPU next to the dense layers, "1" always keeps them in host memory, "0"
+// never does and leaves the placement to llama-server's --fit.
+func CPUMoE() string {
+	switch s := strings.ToLower(strings.TrimSpace(Var("OLLAMA_CPU_MOE"))); s {
+	case "", "auto":
+		return ""
+	case "1", "true", "on", "yes":
+		return "1"
+	case "0", "false", "off", "no":
+		return "0"
+	default:
+		slog.Warn("invalid environment variable, using auto", "key", "OLLAMA_CPU_MOE", "value", s)
+		return ""
+	}
+}
+
+// MoECacheMiB is the size of the GPU cache for experts kept in host memory
+// (llama-server --moe-cache-mib). -1 (the default) sizes it from the VRAM left
+// after the dense layers, the KV cache and the draft model; 0 disables it.
+func MoECacheMiB() int {
+	if s := Var("OLLAMA_MOE_CACHE_MIB"); s != "" {
+		if n, err := strconv.Atoi(s); err == nil && n >= -1 {
+			return n
+		}
+		slog.Warn("invalid environment variable, using auto", "key", "OLLAMA_MOE_CACHE_MIB", "value", s)
+	}
+	return -1
+}
+
+// NumUBatch caps the physical batch (llama-server -ub) below the logical
+// batch (-b). 0 (the default) keeps -ub equal to -b, except with the experts
+// in host memory where it defaults to 512: the compute buffers scale with it
+// and the CPU gains nothing from a larger one.
+func NumUBatch() int {
+	return int(Uint("OLLAMA_NUM_UBATCH", 0)())
+}
+
 func PromptCacheRAM() int {
 	mib := 8192
 	if PromptCacheDir() != "" {
@@ -385,6 +424,9 @@ func AsMap() map[string]EnvVar {
 		"OLLAMA_MODELS":                   {"OLLAMA_MODELS", Models(), "The path to the models directory"},
 		"OLLAMA_PROMPT_CACHE_DIR":         {"OLLAMA_PROMPT_CACHE_DIR", PromptCacheDir(), "Directory to persist prompt caches to disk, kept for the model's keep-alive duration (default: disabled)"},
 		"OLLAMA_PROMPT_CACHE_RAM":         {"OLLAMA_PROMPT_CACHE_RAM", PromptCacheRAM(), "Size in MiB of the host memory prompt cache holding displaced prompts (default 8192, -1 unlimited, 0 disabled)"},
+		"OLLAMA_CPU_MOE":                  {"OLLAMA_CPU_MOE", CPUMoE(), "Keep MoE expert weights in host memory: auto (default, when they do not fit VRAM), 1 always, 0 never"},
+		"OLLAMA_MOE_CACHE_MIB":            {"OLLAMA_MOE_CACHE_MIB", MoECacheMiB(), "GPU cache in MiB for experts kept in host memory (default -1: size from the VRAM left, 0 disabled)"},
+		"OLLAMA_NUM_UBATCH":               {"OLLAMA_NUM_UBATCH", NumUBatch(), "Physical batch size (-ub) when smaller than the batch size (default: batch size, 512 with experts in host memory)"},
 		"OLLAMA_PROMPT_CACHE_IDLE_UNLOAD": {"OLLAMA_PROMPT_CACHE_IDLE_UNLOAD", PromptCacheIdleUnload(), "Unload a model with an on-disk prompt cache after this long idle, regardless of keep-alive (default: disabled)"},
 		"OLLAMA_NO_CLOUD":                 {"OLLAMA_NO_CLOUD", NoCloud(), "Disable Ollama cloud features (remote inference and web search)"},
 		"OLLAMA_NOHISTORY":                {"OLLAMA_NOHISTORY", NoHistory(), "Do not preserve readline history"},

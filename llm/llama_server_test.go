@@ -2018,7 +2018,7 @@ func TestAppendBatchArgs(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			got := appendBatchArgs(nil, tt.opts, tt.embedding, tt.numParallel)
+			got := appendBatchArgs(nil, tt.opts, tt.embedding, tt.numParallel, 0)
 			if !slices.Equal(got, tt.want) {
 				t.Fatalf("appendBatchArgs = %v, want %v", got, tt.want)
 			}

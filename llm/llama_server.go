@@ -458,8 +458,6 @@ func startLlamaServer(launch llamaServerLaunchConfig, out io.Writer) (cmd *exec.
 
 	params = appendFlashAttentionArgs(params, launch.gpus)
 
-	launch.opts.NumBatch = 4096
-
 	params = appendBatchArgs(params, launch.opts, launch.embedding, launch.numParallel)
 
 	// GPU layer offloading — only pass if user explicitly set it (non-default).

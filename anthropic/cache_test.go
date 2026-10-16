@@ -748,7 +748,7 @@ func TestThinkFromThinkingConfig(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			got := thinkFromThinkingConfig(tt.thinking, tt.output)
+			got := thinkFromThinkingConfig(tt.thinking, tt.output, nil)
 			if tt.want == nil {
 				if got != nil {
 					t.Fatalf("think = %v, want nil (model default)", got.Value)

@@ -21,16 +21,19 @@ func TestThinkingConversionMetadata(t *testing.T) {
 			name, fields            string
 			wantGeneric, wantLegacy any
 		}{
-			{"omitted", ``, nil, nil},
-			{"empty", `,"output_config":{"effort":""}`, nil, nil},
+			// fork: a missing thinking block is how budget_tokens clients (Claude Code) turn thinking off
+			{"omitted", ``, false, false},
+			{"empty", `,"output_config":{"effort":""}`, false, false},
 			{"supported", `,"output_config":{"effort":"max"}`, "max", "max"},
 			{"unsupported", `,"output_config":{"effort":"low"}`, "low", "low"},
 			{"xhigh", `,"output_config":{"effort":"xhigh"}`, "xhigh", "high"},
-			{"minimal", `,"output_config":{"effort":"minimal"}`, "minimal", nil},
-			{"future", `,"output_config":{"effort":"future"}`, "future", nil},
+			// fork: minimal maps onto the smallest level, an unknown effort with no thinking block turns thinking off
+			{"minimal", `,"output_config":{"effort":"minimal"}`, "minimal", "low"},
+			{"future", `,"output_config":{"effort":"future"}`, "future", false},
 			{"exact spelling", `,"output_config":{"effort":" HIGH "}`, " HIGH ", "high"},
 			{"adaptive", `,"thinking":{"type":"adaptive"},"output_config":{"effort":"xhigh"}`, "xhigh", "high"},
-			{"enabled precedence", `,"thinking":{"type":"enabled"},"output_config":{"effort":"xhigh"}`, true, true},
+			// fork: output_config.effort carries the level, thinking.type only switches
+			{"enabled precedence", `,"thinking":{"type":"enabled"},"output_config":{"effort":"xhigh"}`, "xhigh", "high"},
 			{"disabled precedence", `,"thinking":{"type":"disabled"},"output_config":{"effort":"xhigh"}`, false, false},
 		} {
 			t.Run(metadata.name+"/"+tt.name, func(t *testing.T) {

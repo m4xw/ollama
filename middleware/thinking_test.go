@@ -37,7 +37,8 @@ func TestThinkingCompatibilityScope(t *testing.T) {
 		{"responses off", ResponsesMiddleware, `"input":"hi","reasoning":{"effort":"none"}`, false, false, false},
 		{"responses native precedence", ResponsesMiddleware, `"input":"hi","think":false,"reasoning":{"effort":"xhigh"}`, false, false, false},
 		{"anthropic adaptive", AnthropicMessagesMiddleware, `"messages":[{"role":"user","content":"hi"}],"max_tokens":64,"thinking":{"type":"adaptive"},"output_config":{"effort":"xhigh"}`, "xhigh", "high", false},
-		{"anthropic unknown", AnthropicMessagesMiddleware, `"messages":[{"role":"user","content":"hi"}],"max_tokens":64,"output_config":{"effort":"future"}`, "future", nil, false},
+		// fork: an unknown effort with no thinking block turns thinking off on legacy models
+		{"anthropic unknown", AnthropicMessagesMiddleware, `"messages":[{"role":"user","content":"hi"}],"max_tokens":64,"output_config":{"effort":"future"}`, "future", false, false},
 		{"anthropic off precedence", AnthropicMessagesMiddleware, `"messages":[{"role":"user","content":"hi"}],"max_tokens":64,"thinking":{"type":"disabled"},"output_config":{"effort":"xhigh"}`, false, false, false},
 	} {
 		for _, name := range []string{"generic", "legacy"} {

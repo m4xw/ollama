@@ -152,6 +152,10 @@ func promptCacheIdentity(launch llamaServerLaunchConfig) string {
 	fmt.Fprintf(h, "kv=%s\n", launch.kvCacheType)
 	fmt.Fprintf(h, "embedding=%t\n", launch.embedding)
 	fmt.Fprintf(h, "draft=%s|%s\n", launch.draftType, launch.config.DraftModelPath)
+	if launch.yarnOrigCtx > 0 {
+		// Saved K is post-RoPE, so a YaRN-scaled state only fits a YaRN runner.
+		fmt.Fprintf(h, "yarn=%d\n", launch.yarnOrigCtx)
+	}
 	for _, adapter := range launch.adapters {
 		fmt.Fprintf(h, "lora=%s\n", adapter)
 	}

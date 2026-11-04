@@ -195,8 +195,21 @@ func supportsContextShift(m *Model) bool {
 	return true
 }
 
-func effectiveModelContext(numCtx int, f *gguf.Model) int {
-	return effectiveContext(numCtx, modelTrainContext(f))
+func effectiveModelContext(numCtx int, f *gguf.Model, numCtxAuto bool) int {
+	return effectiveContext(numCtx, modelContextLimit(f, numCtxAuto))
+}
+
+// modelContextLimit is the largest num_ctx a load of f serves: its training
+// context, unless num_ctx was set explicitly and OLLAMA_YARN extends it.
+func modelContextLimit(f *gguf.Model, numCtxAuto bool) int {
+	return contextLimit(modelTrainContext(f), llm.YaRNExtendable(f), numCtxAuto)
+}
+
+func contextLimit(trainCtx int, yarn, numCtxAuto bool) int {
+	if yarn && !numCtxAuto {
+		return 0
+	}
+	return trainCtx
 }
 
 func modelTrainContext(f *gguf.Model) int {
@@ -622,7 +635,7 @@ func (s *Scheduler) load(req *LlmRequest, systemInfo ml.SystemInfo, gpus []ml.De
 				return false
 			}
 
-			predictedCtx := effectiveLlamaServerContext(req.opts.NumCtx, f, numParallel)
+			predictedCtx := effectiveLlamaServerContext(req.opts.NumCtx, f, numParallel, req.numCtxAuto)
 			predicted := llm.PredictServerVRAM(req.model.ModelPath, f, predictedCtx)
 			loadGpus, launchOpts = selectLlamaServerPlacement(systemInfo, gpus, predicted, req.opts)
 			availableForBatch, _, _ := availableMemoryForPlacement(systemInfo, loadGpus, launchOpts)
@@ -666,6 +679,7 @@ func (s *Scheduler) load(req *LlmRequest, systemInfo ml.SystemInfo, gpus []ml.De
 
 			config := llamaServerConfigForModel(req.model)
 			config.ContextShift = req.contextShift
+			config.NumCtxAuto = req.numCtxAuto
 			llama, err = s.newServerFn(systemInfo, loadGpus, req.model.ModelPath, f, req.model.AdapterPaths, req.model.ProjectorPaths, launchOpts, numParallel, config)
 			if err != nil {
 				// some older models are not compatible with newer versions of llama.cpp
@@ -786,6 +800,7 @@ iGPUScan:
 
 	totalSize, vramSize := llama.MemorySize()
 	trainContext := modelTrainContext(f)
+	yarnContext := llm.YaRNExtendable(f)
 	if effectiveNumCtx := llama.ContextLength(); req.model.ModelPath != "" && effectiveNumCtx > 0 {
 		req.opts.NumCtx = effectiveNumCtx
 		req.contextShift = resolveContextShift(req.shift, req.model)
@@ -817,6 +832,7 @@ iGPUScan:
 		useMMapAuto:     req.useMMapAuto,
 		contextShift:    req.contextShift,
 		trainContext:    trainContext,
+		yarnContext:     yarnContext,
 	}
 	runner.numParallel = numParallel
 	runner.refMu.Lock() // hold lock until running or aborted
@@ -880,7 +896,7 @@ func (req *LlmRequest) reduceAutoNumCtxForLoadOOM(f *gguf.Model, numParallel int
 	}
 
 	req.opts.NumCtx = newNumCtx
-	predictedCtx := effectiveLlamaServerContext(req.opts.NumCtx, f, numParallel)
+	predictedCtx := effectiveLlamaServerContext(req.opts.NumCtx, f, numParallel, req.numCtxAuto)
 	predictedVRAM := llm.PredictServerVRAM(req.model.ModelPath, f, predictedCtx)
 	available, _, _ := availableMemoryForPlacement(systemInfo, gpus, launchOpts)
 	req.applyAutomaticGenerationBatch(completion, predictedCtx, predictedVRAM, available, llm.LlamaServerFlashAttention(gpus), gpus)
@@ -896,8 +912,8 @@ func explicitPartialGPUOffload(opts api.Options, f *gguf.Model) bool {
 	return uint64(opts.NumGPU) < f.KV().BlockCount()+1
 }
 
-func effectiveLlamaServerContext(numCtx int, f *gguf.Model, numParallel int) int {
-	return effectiveModelContext(numCtx, f) * max(numParallel, 1)
+func effectiveLlamaServerContext(numCtx int, f *gguf.Model, numParallel int, numCtxAuto bool) int {
+	return effectiveModelContext(numCtx, f, numCtxAuto) * max(numParallel, 1)
 }
 
 const (
@@ -1224,7 +1240,7 @@ func logSelectedGPUGroup(all, selected []ml.DeviceInfo) {
 }
 
 func (s *Scheduler) applyLlamaServerMmapDefaults(req *LlmRequest, launchOpts api.Options, systemInfo ml.SystemInfo, gpus []ml.DeviceInfo, f *gguf.Model, numParallel int) api.Options {
-	predictedCtx := effectiveLlamaServerContext(req.opts.NumCtx, f, numParallel)
+	predictedCtx := effectiveLlamaServerContext(req.opts.NumCtx, f, numParallel, req.numCtxAuto)
 	predictedVRAM := llm.PredictServerVRAM(req.model.ModelPath, f, predictedCtx)
 	availableVRAM, _, _ := availableMemoryForPlacement(systemInfo, gpus, launchOpts)
 
@@ -1288,7 +1304,7 @@ func allDevicesLibrary(gpus []ml.DeviceInfo, library string) bool {
 func (s *Scheduler) maybeDisableMmapForHostPressure(req *LlmRequest, launchOpts api.Options, systemInfo ml.SystemInfo, gpus []ml.DeviceInfo, f *gguf.Model, numParallel int) {
 	modelSize := modelFileSize(req.model.modelPaths()...)
 	loadedMmapSize := s.loadedMmapModelSizeLocked()
-	predictedCtx := effectiveLlamaServerContext(req.opts.NumCtx, f, numParallel)
+	predictedCtx := effectiveLlamaServerContext(req.opts.NumCtx, f, numParallel, req.numCtxAuto)
 	predictedVRAM := llm.PredictServerVRAM(req.model.ModelPath, f, predictedCtx)
 	availableVRAM, _, _ := availableMemoryForPlacement(systemInfo, gpus, launchOpts)
 	placementGpus := gpusForPlacement(gpus, launchOpts)
@@ -1453,6 +1469,7 @@ type runnerRef struct {
 	useMMapAuto  bool
 	contextShift bool
 	trainContext int
+	yarnContext  bool
 	*api.Options
 }
 
@@ -1488,7 +1505,7 @@ func (runner *runnerRef) needsReload(ctx context.Context, req *LlmRequest) bool 
 	// Don't reload runner if num_gpu=-1 was provided
 	optsExisting := runner.Options.Runner
 	optsNew := req.opts.Runner
-	optsNew.NumCtx = effectiveContext(optsNew.NumCtx, runner.trainContext)
+	optsNew.NumCtx = effectiveContext(optsNew.NumCtx, contextLimit(runner.trainContext, runner.yarnContext, req.numCtxAuto))
 	if runner.numCtxAuto && req.numCtxAuto {
 		optsNew.NumCtx = optsExisting.NumCtx
 	}

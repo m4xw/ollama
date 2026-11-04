@@ -2359,3 +2359,23 @@ func TestIdleUnloadDuration(t *testing.T) {
 		})
 	}
 }
+
+func TestContextLimit(t *testing.T) {
+	tests := []struct {
+		name       string
+		yarn, auto bool
+		want       int
+	}{
+		{"no yarn", false, false, 262144},
+		{"yarn explicit", true, false, 0},
+		{"yarn auto", true, true, 262144},
+	}
+	for _, tt := range tests {
+		if got := contextLimit(262144, tt.yarn, tt.auto); got != tt.want {
+			t.Errorf("%s: contextLimit = %d, want %d", tt.name, got, tt.want)
+		}
+		if got := effectiveContext(1048576, contextLimit(262144, tt.yarn, tt.auto)); tt.want == 0 && got != 1048576 {
+			t.Errorf("%s: effective num_ctx = %d, want 1048576", tt.name, got)
+		}
+	}
+}

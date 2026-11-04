@@ -29,11 +29,13 @@ func TestAnthropicWebSearchThinking(t *testing.T) {
 		{"nonthinking/enabled", `,"thinking":{"type":"enabled","budget_tokens":1024}`, false, nil},
 		{"nonthinking/effort", `,"output_config":{"effort":"high"}`, false, nil},
 		{"nonthinking/disabled", `,"thinking":{"type":"disabled"}`, false, false},
-		{"nonthinking/omitted", "", false, nil},
-		{"thinking/enabled", `,"thinking":{"type":"enabled","budget_tokens":1024}`, true, true},
+		// fork: a missing thinking block is how budget_tokens clients (Claude Code) turn thinking off
+		{"nonthinking/omitted", "", false, false},
+		// fork: budget_tokens maps onto an effort level
+		{"thinking/enabled", `,"thinking":{"type":"enabled","budget_tokens":1024}`, true, "low"},
 		{"thinking/effort", `,"output_config":{"effort":"xhigh"}`, true, "high"},
 		{"thinking/disabled", `,"thinking":{"type":"disabled"}`, true, false},
-		{"thinking/omitted", "", true, true},
+		{"thinking/omitted", "", true, false},
 	} {
 		for _, streaming := range []bool{false, true} {
 			t.Run(fmt.Sprintf("%s/stream=%t", tt.name, streaming), func(t *testing.T) {

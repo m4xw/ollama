@@ -9,10 +9,10 @@ pre-rendered /completion prompt never has, so the field was silently ignored. Th
 parses it again when the request carries no chat template.
 
 diff --git a/tools/server/server-context.cpp b/tools/server/server-context.cpp
-index 8e14fd02f..f5322e423 100644
+index 91e5c6401..5ae182a1a 100644
 --- a/tools/server/server-context.cpp
 +++ b/tools/server/server-context.cpp
-@@ -4953,6 +4953,20 @@ std::unique_ptr<server_res_generator> server_routes::handle_completions_impl(
+@@ -5374,6 +5374,20 @@ std::unique_ptr<server_res_generator> server_routes::handle_completions_impl(
  
          // tasks.reserve(inputs.size()); // TODO: this is inaccurate due to child tasks
  
@@ -33,7 +33,7 @@ index 8e14fd02f..f5322e423 100644
          for (size_t i = 0; i < inputs.size(); i++) {
              server_task task = server_task(type);
  
-@@ -4967,6 +4981,10 @@ std::unique_ptr<server_res_generator> server_routes::handle_completions_impl(
+@@ -5388,6 +5402,10 @@ std::unique_ptr<server_res_generator> server_routes::handle_completions_impl(
  
              task.apply_chat_session(chat_session);
  

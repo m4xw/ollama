@@ -321,6 +321,9 @@ var (
 	SchedSpread = Bool("OLLAMA_SCHED_SPREAD")
 	// ContextLength sets the default context length
 	ContextLength = Uint("OLLAMA_CONTEXT_LENGTH", 0)
+	// YaRN lets an explicit num_ctx above a model's training context extend it
+	// with YaRN RoPE scaling instead of being clamped to the training context.
+	YaRN = Bool("OLLAMA_YARN")
 	// Auth enables authentication between the Ollama client and server
 	UseAuth = Bool("OLLAMA_AUTH")
 	// EnableVulkan controls Vulkan backend discovery.
@@ -426,6 +429,7 @@ func AsMap() map[string]EnvVar {
 		"OLLAMA_PROMPT_CACHE_RAM":         {"OLLAMA_PROMPT_CACHE_RAM", PromptCacheRAM(), "Size in MiB of the host memory prompt cache holding displaced prompts (default 8192, -1 unlimited, 0 disabled)"},
 		"OLLAMA_CPU_MOE":                  {"OLLAMA_CPU_MOE", CPUMoE(), "Keep MoE expert weights in host memory: auto (default, when they do not fit VRAM), 1 always, 0 never"},
 		"OLLAMA_MOE_CACHE_MIB":            {"OLLAMA_MOE_CACHE_MIB", MoECacheMiB(), "GPU cache in MiB for experts kept in host memory (default -1: size from the VRAM left, 0 disabled)"},
+		"OLLAMA_YARN":                     {"OLLAMA_YARN", YaRN(), "Extend context past a model's training length with YaRN when num_ctx asks for more (default: clamp to training length)"},
 		"OLLAMA_NUM_UBATCH":               {"OLLAMA_NUM_UBATCH", NumUBatch(), "Physical batch size (-ub) when smaller than the batch size (default: batch size, 512 with experts in host memory)"},
 		"OLLAMA_PROMPT_CACHE_IDLE_UNLOAD": {"OLLAMA_PROMPT_CACHE_IDLE_UNLOAD", PromptCacheIdleUnload(), "Unload a model with an on-disk prompt cache after this long idle, regardless of keep-alive (default: disabled)"},
 		"OLLAMA_NO_CLOUD":                 {"OLLAMA_NO_CLOUD", NoCloud(), "Disable Ollama cloud features (remote inference and web search)"},

@@ -219,6 +219,8 @@ type llamaServerLaunchConfig struct {
 	extraEnvs            map[string]string
 	forceNoMMProjOffload bool
 	hostExperts          hostExpertsPlan
+	// yarnOrigCtx is the training context YaRN extends to opts.NumCtx, or 0.
+	yarnOrigCtx int
 }
 
 func newLlamaServerHTTPClient() *http.Client {
@@ -445,6 +447,7 @@ func startLlamaServer(launch llamaServerLaunchConfig, out io.Writer) (cmd *exec.
 	params = appendDraftArgs(params, launch.draftType, launch.config.DraftModelPath, launch.opts)
 
 	params = append(params, qwenVLServerArgs(launch.modelArch)...)
+	params = append(params, yarnArgs(launch.yarnOrigCtx, launch.opts.NumCtx)...)
 
 	for _, adapter := range launch.adapters {
 		slog.Warn("LoRA adapters are deprecated and will be removed in a future release", "adapter", adapter)
@@ -1050,6 +1053,7 @@ func NewLlamaServerRunner(
 		gpuLibs:      slices.Clone(gpuLibs),
 		extraEnvs:    cloneStringMap(serverEnvs),
 		hostExperts:  planHostExperts(f, gpus, opts, numParallel, kvCacheType, config.DraftModelPath),
+		yarnOrigCtx:  yarnOrigContext(f, opts.NumCtx),
 	}
 
 	s := &llamaServerRunner{

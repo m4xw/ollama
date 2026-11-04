@@ -83,6 +83,9 @@ type LlamaServerConfig struct {
 	ManifestDigest       string
 	DraftModelPath       string
 	DraftModelShardPaths []string
+	// NumCtxAuto marks num_ctx as Ollama's automatic choice, which is never
+	// YaRN-extended past the training context; only an explicit one is.
+	NumCtxAuto bool
 }
 
 // IsLlamaCPP reports whether the server is backed by the llama.cpp
@@ -106,9 +109,12 @@ func LoadModel(model string, maxArraySize int, shards ...string) (*gguf.Model, e
 func NewLlamaServer(systemInfo ml.SystemInfo, gpus []ml.DeviceInfo, modelPath string, f *gguf.Model, adapters, projectors []string, opts api.Options, numParallel int, config LlamaServerConfig) (LlamaServer, error) {
 	slog.Info("using llama-server for model", "model", modelPath)
 
-	// Verify the requested context size is <= the model training size
+	// Verify the requested context size is <= the model training size, unless
+	// an explicit num_ctx asks for more and YaRN may extend it (OLLAMA_YARN).
 	trainCtx := f.KV().ContextLength()
-	if opts.NumCtx > int(trainCtx) && trainCtx > 0 {
+	if opts.NumCtx > int(trainCtx) && trainCtx > 0 && !config.NumCtxAuto && YaRNExtendable(f) {
+		slog.Info("extending context past the model's training size with YaRN", "num_ctx", opts.NumCtx, "n_ctx_train", trainCtx)
+	} else if opts.NumCtx > int(trainCtx) && trainCtx > 0 {
 		slog.Warn("requested context size too large for model", "num_ctx", opts.NumCtx, "n_ctx_train", trainCtx)
 		opts.NumCtx = int(trainCtx)
 	}

@@ -5,12 +5,22 @@ REM The prompt cache lets a conversation survive an unload, a restart, or a
 REM taskkill: the slot state is mirrored to disk after every completion and
 REM read back when the model loads again.
 REM
-REM Build what this runs first:
+REM Prerequisites: CMake, Go, VS 2022 C++ tools with the Windows SDK, CUDA 13
+REM (install it after VS), and C:\msys64\mingw64\bin on PATH for cgo.
+REM
+REM Build what this runs first. Configure once, and again if build\ is deleted:
+REM   cmake -B build . -DOLLAMA_LLAMA_BACKENDS=cuda_v13 #-DFETCHCONTENT_SOURCE_DIR_LLAMA_CPP=C:/Development/llama.cpp-ollama
+REM Without OLLAMA_LLAMA_BACKENDS the build is CPU-only. The llama.cpp override
+REM must already have the llama\compat patches applied, as they are skipped here.
+REM
+REM Native payload, needed on a fresh build\ and after a change under llama\:
+REM   cmake --build build --config Release --parallel 8
+REM It carries llama\compat\003-server-prompt-cache-disk.patch, without which a
+REM restored hybrid model re-processes the whole prompt on the next turn.
+REM
+REM The server binary, needed after any Go change (cmake writes ollama.exe to
+REM the repo root instead, which this script does not run):
 REM   go build -ldflags="-s -w" -o build\ollama-dev.exe .
-REM   cmake --build build --config Release --target ollama-llama-server-local
-REM (the second one is only needed after a change under llama\, and it carries
-REM  llama\compat\002-server-slot-checkpoints.patch, without which a restored
-REM  hybrid model re-processes the whole prompt on the next turn)
 
 setlocal
 
@@ -34,14 +44,15 @@ REM second slot doubles the context allocation for nothing.
 set OLLAMA_NUM_PARALLEL=1
 set OLLAMA_MAX_LOADED_MODELS=1
 REM Deprecated: set OLLAMA_NUM_BATCH=8192
-set OLLAMA_NUM_UBATCH=2048
-set LLAMA_ATTN_ROT_DISABLE=1
+set OLLAMA_NUM_UBATCH=1536
+REM set OLLAMA_YARN=1
+REM set LLAMA_ATTN_ROT_DISABLE=1
 
 REM --- model -------------------------------------------------------------
 if "%OLLAMA_KEEP_ALIVE%"=="" set OLLAMA_KEEP_ALIVE=-1
-if "%OLLAMA_CONTEXT_LENGTH%"=="" set OLLAMA_CONTEXT_LENGTH=262144
+if "%OLLAMA_CONTEXT_LENGTH%"=="" set OLLAMA_CONTEXT_LENGTH=131072
 if "%OLLAMA_FLASH_ATTENTION%"=="" set OLLAMA_FLASH_ATTENTION=1
-if "%OLLAMA_CPU_MOE%"=="" set OLLAMA_CPU_MOE=1
+if "%OLLAMA_CPU_MOE%"=="" set OLLAMA_CPU_MOE=0
 
 REM Nemotron-H hybrids only have a KV cache on their few attention layers (8 of
 REM 88 on Bolt: ~0.5 GiB at 128k in q8_0), so q4_0 saves ~250 MiB for a real

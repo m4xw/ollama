@@ -405,7 +405,7 @@ func startLlamaServer(launch llamaServerLaunchConfig, out io.Writer) (cmd *exec.
 		"--port", strconv.Itoa(port),
 		"--host", "127.0.0.1",
 		"--no-webui",
-		"--reasoning-preserve",
+		//"--reasoning-preserve",
 		"--offline",
 		"-c", strconv.Itoa(launch.opts.NumCtx * launch.numParallel),
 	}
@@ -419,9 +419,11 @@ func startLlamaServer(launch llamaServerLaunchConfig, out io.Writer) (cmd *exec.
 			"-np", strconv.Itoa(launch.numParallel),
 			"--cont-batching",
 			"--kv-unified",
-			//"--fit", "on",
+			"--fit", "on",
 			"--spec-type", "none",
 			"--swa-full",
+			//"-cmoe",
+			"--moe-cache-mib", "2148",
 			// Displaced prompts are parked in host memory and read back when they
 			// return, so a background task taking the slot over does not cost the
 			// conversation its prefill. See envconfig.PromptCacheRAM.
@@ -471,6 +473,7 @@ func startLlamaServer(launch llamaServerLaunchConfig, out io.Writer) (cmd *exec.
 
 	// GPU layer offloading — only pass if user explicitly set it (non-default).
 	// Default behavior: let llama-server auto-detect via -ngl auto.
+	//launch.opts.NumGPU = 70
 	if launch.opts.NumGPU > 0 {
 		params = append(params, "-ngl", strconv.Itoa(launch.opts.NumGPU))
 	} else if launch.opts.NumGPU == 0 {
